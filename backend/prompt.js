@@ -11,8 +11,12 @@ Your sole purpose is to convert raw, unstructured airline engine-out procedure t
 CRITICAL RULES:
 1. NO HALLUCINATION: You must only extract data explicitly present in the text. 
 2. DISTANCE (distanceNM): If a leg distance is NOT explicitly written in the text (e.g., "Track to PHX36"), you MUST set distanceNM to null. Do not guess. Do not estimate. 
-3. HEADING (headingDegrees): If a procedure is an RNAV sequence passing through waypoints without explicit headings, you must estimate the heading between the waypoints to give the frontend a directional vector, OR set it to null if the turn is implied by the fix.
-4. PROCEDURE TYPES: 
+3. SEGMENT TYPES: Use ARINC-inspired path terminators:
+   - HEADING_TO_ALTITUDE: a VA-style leg. Use when text says to fly runway heading, assigned heading, or a heading until reaching an altitude. headingDegrees is required. terminationAltitude should be set when explicitly stated.
+   - DIRECT_TO_FIX: a DF-style leg. Use when text says proceed direct/direct to a named fix. targetWaypoint is required.
+   - TRACK_TO_FIX: a TF-style leg. Use when a published route, VIA column, FMS/EO SID code, or map waypoint sequence defines track-to-fix legs. If you see a VIA code like AA01R and a sequence of waypoints on the map, encode those as TRACK_TO_FIX segments in order. targetWaypoint is required.
+4. HEADING (headingDegrees): If a procedure is an RNAV sequence passing through waypoints without explicit headings, you may estimate the heading between visible waypoints to give the frontend a directional vector, OR set it to null if the turn is implied by the fix.
+5. PROCEDURE TYPES: 
    - 'heading_turn': Straight climb followed by a radar vector (e.g., "Climb runway heading to 400ft, then turn right heading 120").
    - 'conditional_route': A multi-step path with triggers (e.g., "Fly heading 014 until 3.5 DME, then direct OAK").
    - 'rnav_sequence': Point-to-point GPS waypoints (e.g., "Track to LAS17, LAS18, LAS08").
@@ -38,15 +42,19 @@ const fewShotExamples = [
                     geometry: {
                         segments: [
                             {
-                                segmentType: "track_to_fix",
+                                segmentType: "TRACK_TO_FIX",
                                 label: "Track to SFO02",
                                 headingDegrees: 14,
+                                targetWaypoint: "SFO02",
+                                terminationAltitude: null,
                                 distanceNM: null
                             },
                             {
-                                segmentType: "heading_turn",
+                                segmentType: "HEADING_TO_ALTITUDE",
                                 label: "Right Turn Hdg 120",
                                 headingDegrees: 120,
+                                targetWaypoint: null,
+                                terminationAltitude: null,
                                 distanceNM: null
                             }
                         ]
@@ -71,14 +79,14 @@ const fewShotExamples = [
                     assignedHeadingDegrees: null,
                     geometry: {
                         segments: [
-                            { segmentType: "track_to_fix", label: "Track to PHX36", headingDegrees: 83, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX37", headingDegrees: 83, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX30", headingDegrees: 83, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX31", headingDegrees: 83, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX32", headingDegrees: 185, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX33", headingDegrees: 240, distanceNM: null },
-                            { segmentType: "track_to_fix", label: "Track to PHX34", headingDegrees: 283, distanceNM: null },
-                            { segmentType: "hold", label: "Hold at PHX34", headingDegrees: 103, distanceNM: null }
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX36", headingDegrees: 83, targetWaypoint: "PHX36", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX37", headingDegrees: 83, targetWaypoint: "PHX37", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX30", headingDegrees: 83, targetWaypoint: "PHX30", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX31", headingDegrees: 83, targetWaypoint: "PHX31", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX32", headingDegrees: 185, targetWaypoint: "PHX32", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX33", headingDegrees: 240, targetWaypoint: "PHX33", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "TRACK_TO_FIX", label: "Track to PHX34", headingDegrees: 283, targetWaypoint: "PHX34", terminationAltitude: null, distanceNM: null },
+                            { segmentType: "DIRECT_TO_FIX", label: "Hold at PHX34", headingDegrees: 103, targetWaypoint: "PHX34", terminationAltitude: null, distanceNM: null }
                         ]
                     }
                 }
