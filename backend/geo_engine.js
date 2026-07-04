@@ -12,53 +12,33 @@ function calculateDmeIntersection(aircraftTrackOrigin, aircraftBearing, navaidCo
 
     const originPoint = turf.point(origin);
     const navaidPoint = turf.point(navaid);
-    let lowNm = 0;
-    let highNm = null;
-    let previousDelta = turf.distance(originPoint, navaidPoint, { units: "nauticalmiles" }) - dmeDistanceNm;
+    let bestCandidate = originPoint;
+    let bestDelta = Math.abs(turf.distance(originPoint, navaidPoint, { units: "nauticalmiles" }) - dmeDistanceNm);
+    let bestDistanceAlongTrackNM = 0;
 
-    for (let distanceAlongTrackNm = 0.25; distanceAlongTrackNm <= 250; distanceAlongTrackNm += 0.25) {
+    for (let distanceAlongTrackNm = 0.1; distanceAlongTrackNm <= 25; distanceAlongTrackNm += 0.1) {
         const candidate = turf.destination(originPoint, distanceAlongTrackNm, bearing, { units: "nauticalmiles" });
-        const delta = turf.distance(candidate, navaidPoint, { units: "nauticalmiles" }) - dmeDistanceNm;
+        const distanceToNavaidNM = turf.distance(candidate, navaidPoint, { units: "nauticalmiles" });
+        const delta = Math.abs(distanceToNavaidNM - dmeDistanceNm);
 
-        if (delta === 0 || Math.sign(delta) !== Math.sign(previousDelta)) {
-            highNm = distanceAlongTrackNm;
-            lowNm = distanceAlongTrackNm - 0.25;
-            break;
-        }
-
-        previousDelta = delta;
-    }
-
-    if (highNm === null) {
-        throw new Error("No forward intersection found for the requested DME radius.");
-    }
-
-    for (let step = 0; step < 60; step += 1) {
-        const midNm = (lowNm + highNm) / 2;
-        const candidate = turf.destination(originPoint, midNm, bearing, { units: "nauticalmiles" });
-        const midDelta = turf.distance(candidate, navaidPoint, { units: "nauticalmiles" }) - dmeDistanceNm;
-        const lowPoint = turf.destination(originPoint, lowNm, bearing, { units: "nauticalmiles" });
-        const lowDelta = turf.distance(lowPoint, navaidPoint, { units: "nauticalmiles" }) - dmeDistanceNm;
-
-        if (midDelta === 0) {
-            lowNm = midNm;
-            highNm = midNm;
-            break;
-        }
-
-        if (Math.sign(midDelta) === Math.sign(lowDelta)) {
-            lowNm = midNm;
-        } else {
-            highNm = midNm;
+        if (delta < bestDelta) {
+            bestCandidate = candidate;
+            bestDelta = delta;
+            bestDistanceAlongTrackNM = distanceAlongTrackNm;
         }
     }
 
-    const intersection = turf.destination(originPoint, highNm, bearing, { units: "nauticalmiles" });
-    const [longitude, latitude] = intersection.geometry.coordinates;
+    if (bestDelta > 0.25) {
+        throw new Error("No forward projected point closely matches the requested DME radius.");
+    }
+
+    const [longitude, latitude] = bestCandidate.geometry.coordinates;
 
     return {
         latitude,
-        longitude
+        longitude,
+        distanceAlongTrackNM: Number(bestDistanceAlongTrackNM.toFixed(1)),
+        dmeErrorNM: Number(bestDelta.toFixed(3))
     };
 }
 
