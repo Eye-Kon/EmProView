@@ -18,8 +18,7 @@ const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max file size
     fileFilter: (req, file, cb) => {
-        const allowedMimes = ['image/jpeg', 'image/png', 'image/webp'];
-        if (allowedMimes.includes(file.mimetype)) {
+        if (resolveSupportedImageMimeType(file)) {
             cb(null, true);
         } else {
             cb(new Error('Invalid file type. Only JPEG, PNG, and WEBP are allowed.'));
@@ -201,6 +200,12 @@ app.post("/api/ocr", requireAuth, (req, res, next) => {
     }
 
     try {
+        const mimeType = resolveSupportedImageMimeType(req.file);
+
+        if (!mimeType) {
+            return res.status(400).json({ error: "Unsupported image type. Only JPEG, PNG, and WEBP are allowed." });
+        }
+
         const base64Image = req.file.buffer.toString("base64");
         const response = await openai.chat.completions.create({
             model: "gpt-4o",
@@ -209,7 +214,7 @@ app.post("/api/ocr", requireAuth, (req, res, next) => {
                     role: "user",
                     content: [
                         { type: "text", text: "Transcribe the text in this image exactly as written. Do not add markdown, formatting, or commentary. Just output the raw text." },
-                        { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${base64Image}` } }
+                        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }
                     ]
                 }
             ]
@@ -243,6 +248,25 @@ function getAirportQuery(airportCode) {
             { "airport.icao": airportCode }
         ]
     };
+}
+
+function resolveSupportedImageMimeType(file) {
+    const extension = path.extname(file.originalname || "").toLowerCase();
+    const reportedMime = (file.mimetype || "").toLowerCase();
+
+    if (extension === ".jpg" || extension === ".jpeg" || reportedMime === "image/jpeg" || reportedMime === "image/jpg") {
+        return "image/jpeg";
+    }
+
+    if (extension === ".png" || reportedMime === "image/png") {
+        return "image/png";
+    }
+
+    if (extension === ".webp" || reportedMime === "image/webp") {
+        return "image/webp";
+    }
+
+    return null;
 }
 
 app.listen(PORT, () => {
