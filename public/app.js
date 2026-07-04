@@ -463,7 +463,7 @@ function validateProcedureSchema(procedure) {
 
       requireString(segment.segmentType, `${segmentPath}.segmentType`, errors);
       requireString(segment.label, `${segmentPath}.label`, errors);
-      requireNumber(segment.headingDegrees, `${segmentPath}.headingDegrees`, errors);
+      requireSegmentHeading(segment, `${segmentPath}.headingDegrees`, errors);
       requireOptionalNullableNumber(segment.distanceNM, `${segmentPath}.distanceNM`, errors);
     });
   });
@@ -506,6 +506,24 @@ function requireOptionalNullableNumber(value, fieldName, errors) {
   }
 
   return requireNumber(value, fieldName, errors);
+}
+
+function requireSegmentHeading(segment, fieldName, errors) {
+  if (typeof segment.headingDegrees === "number" && !Number.isNaN(segment.headingDegrees)) {
+    return true;
+  }
+
+  const hasSpatialTrigger = segment.spatialTrigger !== null && segment.spatialTrigger !== undefined;
+  const hasComputedSpatialTrigger =
+    segment.computedSpatialTrigger?.computedTurnPoint !== null && segment.computedSpatialTrigger?.computedTurnPoint !== undefined;
+  const hasTargetWaypoint = typeof segment.targetWaypoint === "string" && segment.targetWaypoint.trim() !== "";
+
+  if (segment.headingDegrees === null && (hasSpatialTrigger || hasComputedSpatialTrigger || hasTargetWaypoint)) {
+    return true;
+  }
+
+  errors.push(`${fieldName} is required unless spatialTrigger or targetWaypoint is present.`);
+  return false;
 }
 
 function requireBoolean(value, fieldName, errors) {
@@ -749,7 +767,14 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
   canvasContext.moveTo(currentPosition.x, currentPosition.y);
 
   segments.forEach((segment, index) => {
-    const headingRadians = degreesToRadians(segment.headingDegrees);
+    const resolvedHeading = resolveSegmentHeading(segment);
+
+    if (resolvedHeading === null) {
+      drawNullHeadingSegment(currentPosition, segment, labelColor);
+      return;
+    }
+
+    const headingRadians = degreesToRadians(resolvedHeading);
     const distanceNM = getSegmentDistanceNM(segment);
     const distance = distanceNM * pixelsPerNM;
     const nextPosition = {
@@ -770,6 +795,56 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
   if (segments.some((segment) => segment.segmentType === "hold")) {
     drawHoldPattern(currentPosition.x, currentPosition.y, strokeColor);
   }
+}
+
+function resolveSegmentHeading(segment) {
+  if (typeof segment.headingDegrees === "number" && !Number.isNaN(segment.headingDegrees)) {
+    return segment.headingDegrees;
+  }
+
+  const actionHeading =
+    segment.computedSpatialTrigger?.resultingAction?.magneticHeading ??
+    segment.spatialTrigger?.resultingAction?.magneticHeading;
+
+  if (typeof actionHeading === "number" && !Number.isNaN(actionHeading)) {
+    return actionHeading;
+  }
+
+  return null;
+}
+
+function drawNullHeadingSegment(position, segment, labelColor) {
+  const computedPoint = segment.computedSpatialTrigger?.computedTurnPoint;
+  const waypointLabel = segment.targetWaypoint || segment.label || "COGO constraint";
+
+  canvasContext.save();
+  canvasContext.fillStyle = labelColor;
+  canvasContext.strokeStyle = labelColor;
+  canvasContext.setLineDash([4, 4]);
+  canvasContext.beginPath();
+  canvasContext.arc(position.x, position.y, 7, 0, Math.PI * 2);
+  canvasContext.stroke();
+  canvasContext.setLineDash([]);
+  canvasContext.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+
+  if (computedPoint) {
+    canvasContext.fillText(`${waypointLabel} ${formatComputedPoint(computedPoint)}`, position.x + 10, position.y - 10);
+  } else {
+    canvasContext.fillText(`${waypointLabel} heading unavailable`, position.x + 10, position.y - 10);
+  }
+
+  canvasContext.restore();
+}
+
+function formatComputedPoint(point) {
+  const latitude = Number(point.latitude);
+  const longitude = Number(point.longitude);
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return "";
+  }
+
+  return `(${latitude.toFixed(4)}, ${longitude.toFixed(4)})`;
 }
 
 function getSegmentDistanceNM(segment) {
