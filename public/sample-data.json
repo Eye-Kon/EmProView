@@ -1,0 +1,370 @@
+[
+  {
+    "id": "aal-sfo-engine-failure-missed-approach",
+    "airline": {
+      "name": "American Airlines",
+      "icao": "AAL"
+    },
+    "source": {
+      "airportCode": "KSFO",
+      "chartTitle": "Engine Failure Procedures - Missed Approach",
+      "chartDate": "2024-02-16",
+      "sourceType": "sample_verified_chart"
+    },
+    "airport": {
+      "icao": "KSFO",
+      "iata": "SFO",
+      "name": "San Francisco International",
+      "city": "San Francisco",
+      "state": "CA",
+      "country": "US"
+    },
+    "procedureType": "heading_turn",
+    "operation": "missed_approach",
+    "applicableAircraft": [
+      "A32F",
+      "777",
+      "787"
+    ],
+    "verification": {
+      "status": "verified_sample",
+      "humanReviewed": true,
+      "displayEligible": true
+    },
+    "procedureRows": [
+      {
+        "rowId": "aal-sfo-19r",
+        "runways": [
+          "19R"
+        ],
+        "triggerFix": "SFO04",
+        "triggerDescription": "D1.2 SFO",
+        "condition": "engine_failure_missed_approach",
+        "instructionText": "Left turn heading 100 degrees.",
+        "turnDirection": "left",
+        "assignedHeadingDegrees": 100,
+        "routeFixes": [
+          "SFO04"
+        ],
+        "holdInstruction": "none",
+        "geometry": {
+          "displayMode": "heading_vector",
+          "startReference": "KSFO",
+          "endReference": "SFO04",
+          "pathLabel": "100 deg",
+          "segments": [
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track runway heading to SFO04",
+              "headingDegrees": 194
+            },
+            {
+              "segmentType": "turn",
+              "label": "LEFT turn",
+              "headingDegrees": 100
+            }
+          ]
+        }
+      },
+      {
+        "rowId": "aal-sfo-28r",
+        "runways": [
+          "28R"
+        ],
+        "triggerFix": "SFO06",
+        "triggerDescription": "D1.1 SFO",
+        "condition": "engine_failure_missed_approach",
+        "instructionText": "Right turn heading 295 degrees.",
+        "turnDirection": "right",
+        "assignedHeadingDegrees": 295,
+        "routeFixes": [
+          "SFO06"
+        ],
+        "holdInstruction": "none",
+        "geometry": {
+          "displayMode": "heading_vector",
+          "startReference": "KSFO",
+          "endReference": "SFO06",
+          "pathLabel": "295 deg",
+          "segments": [
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track runway heading to SFO06",
+              "headingDegrees": 284
+            },
+            {
+              "segmentType": "turn",
+              "label": "RIGHT turn",
+              "headingDegrees": 295
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "dal-sfo-engine-out-departure-1lr",
+    "airline": {
+      "name": "Delta Air Lines",
+      "icao": "DAL"
+    },
+    "source": {
+      "airportCode": "KSFO",
+      "chartTitle": "Critical Performance Procedures - Engine Out",
+      "chartDate": "2025-05-23",
+      "sourceType": "sample_verified_chart"
+    },
+    "airport": {
+      "icao": "KSFO",
+      "iata": "SFO",
+      "name": "San Francisco International",
+      "city": "San Francisco",
+      "state": "CA",
+      "country": "US"
+    },
+    "procedureType": "conditional_route",
+    "operation": "departure",
+    "applicableAircraft": [
+      "ALL"
+    ],
+    "verification": {
+      "status": "verified_sample",
+      "humanReviewed": true,
+      "displayEligible": true
+    },
+    "procedureRows": [
+      {
+        "rowId": "dal-sfo-1lr-prior-d35",
+        "runways": [
+          "01L"
+        ],
+        "triggerFix": "D3.5 SFO",
+        "triggerDescription": "Prior to D3.5 SFO",
+        "condition": "engine_failure_prior_to_d35_sfo",
+        "instructionText": "Fly lateral path or assigned heading until reaching D3.5 SFO VOR. At D3.5 SFO, proceed direct OAK VOR. Hold as depicted until reaching appropriate altitude for route of flight.",
+        "turnDirection": "not_applicable",
+        "assignedHeadingDegrees": 0,
+        "routeFixes": [
+          "D3.5 SFO",
+          "OAK"
+        ],
+        "holdInstruction": "Hold at OAK VOR as depicted until reaching appropriate altitude for route of flight.",
+        "geometry": {
+          "displayMode": "conditional_route",
+          "startReference": "KSFO",
+          "endReference": "OAK",
+          "pathLabel": "D3.5 SFO direct OAK hold",
+          "segments": [
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to D3.5 SFO",
+              "headingDegrees": 0
+            },
+            {
+              "segmentType": "direct_to_fix",
+              "label": "Proceed direct OAK",
+              "headingDegrees": 63
+            },
+            {
+              "segmentType": "hold",
+              "label": "Hold at OAK",
+              "headingDegrees": 243
+            }
+          ]
+        }
+      },
+      {
+        "rowId": "dal-sfo-1lr-after-d35",
+        "runways": [
+          "01L"
+        ],
+        "triggerFix": "D3.5 SFO",
+        "triggerDescription": "After D3.5 SFO",
+        "condition": "engine_failure_after_d35_sfo",
+        "instructionText": "Depart via SID or as cleared by ATC.",
+        "turnDirection": "not_applicable",
+        "assignedHeadingDegrees": 0,
+        "routeFixes": [
+          "SID"
+        ],
+        "holdInstruction": "none",
+        "geometry": {
+          "displayMode": "reference_only",
+          "startReference": "D3.5 SFO",
+          "endReference": "SID",
+          "pathLabel": "SID or ATC clearance",
+          "segments": [
+            {
+              "segmentType": "reference",
+              "label": "Depart via SID or ATC clearance",
+              "headingDegrees": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "aal-phx-missed-approach-08",
+    "airline": {
+      "name": "American Airlines",
+      "icao": "AAL"
+    },
+    "source": {
+      "airportCode": "KPHX",
+      "chartTitle": "Engine Failure Procedures - Missed Approach",
+      "chartDate": "2023-09-15",
+      "sourceType": "sample_verified_chart"
+    },
+    "airport": {
+      "icao": "KPHX",
+      "iata": "PHX",
+      "name": "Phoenix Sky Harbor",
+      "city": "Phoenix",
+      "state": "AZ",
+      "country": "US"
+    },
+    "procedureType": "rnav_sequence",
+    "operation": "missed_approach",
+    "applicableAircraft": [
+      "737",
+      "777",
+      "787"
+    ],
+    "verification": {
+      "status": "verified_sample",
+      "humanReviewed": true,
+      "displayEligible": true
+    },
+    "procedureRows": [
+      {
+        "rowId": "aal-phx-08-rnav",
+        "runways": [
+          "08"
+        ],
+        "triggerFix": "KPHX",
+        "triggerDescription": "Missed Approach",
+        "condition": "engine_failure_missed_approach",
+        "instructionText": "Track 083 to PHX36, PHX37, PHX30, PHX31. Right turn to PHX32, PHX33, PHX34. Hold at PHX34.",
+        "turnDirection": "right",
+        "assignedHeadingDegrees": null,
+        "routeFixes": [
+          "PHX36",
+          "PHX31",
+          "PHX32",
+          "PHX33",
+          "PHX34"
+        ],
+        "holdInstruction": "Hold at PHX34.",
+        "geometry": {
+          "displayMode": "rnav_sequence",
+          "startReference": "KPHX",
+          "endReference": "PHX34",
+          "pathLabel": "RNAV 08 to PHX34 Hold",
+          "segments": [
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to PHX31",
+              "headingDegrees": 83,
+              "distanceNM": 8
+            },
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to PHX32",
+              "headingDegrees": 185,
+              "distanceNM": 5.5
+            },
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to PHX33",
+              "headingDegrees": 240,
+              "distanceNM": 4.5
+            },
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to PHX34",
+              "headingDegrees": 283,
+              "distanceNM": 6
+            },
+            {
+              "segmentType": "hold",
+              "label": "Hold at PHX34",
+              "headingDegrees": 103,
+              "distanceNM": 4
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "ai-extracted-1782338602539",
+    "airline": {
+      "name": "AI Extracted Procedure",
+      "icao": "AI"
+    },
+    "source": {
+      "airportCode": "KSFO",
+      "chartTitle": "Live AI Extraction",
+      "chartDate": "2026-06-24",
+      "sourceType": "ai_structured_output"
+    },
+    "airport": {
+      "icao": "KSFO",
+      "iata": "SFO",
+      "name": "KSFO",
+      "city": "Unknown",
+      "state": "Unknown",
+      "country": "Unknown"
+    },
+    "procedureType": "heading_turn",
+    "operation": "ai_extraction",
+    "applicableAircraft": [
+      "UNKNOWN"
+    ],
+    "verification": {
+      "status": "ai_unverified",
+      "humanReviewed": false,
+      "displayEligible": true
+    },
+    "procedureRows": [
+      {
+        "rowId": "ai-row-1",
+        "runways": [
+          "01R"
+        ],
+        "triggerFix": "Track to SFO02",
+        "triggerDescription": "AI extracted chart text",
+        "condition": "ai_extracted_engine_out",
+        "instructionText": "SFO02, RIGHT Hdg 120",
+        "turnDirection": "not_applicable",
+        "assignedHeadingDegrees": 120,
+        "routeFixes": [
+          "Track to SFO02",
+          "Right Turn Hdg 120"
+        ],
+        "holdInstruction": "none",
+        "geometry": {
+          "displayMode": "heading_turn",
+          "startReference": "KSFO",
+          "endReference": "Right Turn Hdg 120",
+          "pathLabel": "KSFO extracted route",
+          "segments": [
+            {
+              "segmentType": "track_to_fix",
+              "label": "Track to SFO02",
+              "headingDegrees": 14,
+              "distanceNM": null
+            },
+            {
+              "segmentType": "track_to_fix",
+              "label": "Right Turn Hdg 120",
+              "headingDegrees": 120,
+              "distanceNM": null
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

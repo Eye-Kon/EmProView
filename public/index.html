@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EmProView Phase 1 Terminal</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="min-h-screen overflow-hidden bg-slate-950 text-slate-100">
+    <main class="flex h-screen flex-col p-4">
+      <header class="mb-4 flex items-center justify-between border-b border-cyan-400/30 pb-3">
+        <div>
+          <p class="text-xs uppercase tracking-[0.35em] text-cyan-300">EmProView</p>
+          <h1 class="text-2xl font-semibold tracking-tight">Emergency Procedure Vector Terminal</h1>
+        </div>
+        <div class="text-right text-xs uppercase tracking-[0.2em] text-slate-400">
+          <p id="api-status" class="text-amber-300">Connecting</p>
+          <p>Phase 1 MVP</p>
+        </div>
+      </header>
+
+      <section class="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_420px]">
+        <section class="terminal-panel flex min-h-0 flex-col">
+          <div class="mb-3 flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-semibold text-cyan-100">Simulated Radar Display</h2>
+              <p class="text-sm text-slate-400">SFO emergency path preview</p>
+            </div>
+          <div id="radar-label" class="rounded border border-cyan-400/30 px-3 py-1 text-xs text-cyan-200" aria-live="polite">
+              Awaiting procedure
+            </div>
+          </div>
+          <div class="radar-shell min-h-0 flex-1">
+            <canvas id="radar-canvas" aria-label="Simulated radar canvas"></canvas>
+          </div>
+        </section>
+
+        <aside class="terminal-panel flex min-h-0 flex-col">
+          <div class="mb-4 flex items-start justify-between gap-3">
+            <div>
+              <h2 class="text-lg font-semibold text-cyan-100">Procedure Status</h2>
+              <p class="text-sm text-slate-400">Verified sample data only. No raw AI output displayed.</p>
+            </div>
+            <button
+              id="archive-btn"
+              type="button"
+              class="hidden rounded-lg border border-red-400/60 px-3 py-2 text-xs font-bold uppercase tracking-[0.16em] text-red-200 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
+            >
+              Archive Active Procedure
+            </button>
+          </div>
+
+          <label for="procedure-select" class="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-400">
+            Select Procedure
+          </label>
+          <select id="procedure-select" class="control-field mb-4">
+            <option value="">Loading procedures...</option>
+          </select>
+
+          <section class="mb-4 rounded-lg border border-cyan-400/20 bg-slate-950/60 p-3">
+            <div class="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-sm font-semibold text-cyan-100">Live AI Extraction</h3>
+                <p class="text-xs text-slate-400">Paste raw chart text and visualize the structured output.</p>
+              </div>
+              <span id="extract-loading" class="hidden text-xs font-semibold uppercase tracking-[0.2em] text-amber-300">
+                Processing
+              </span>
+            </div>
+            <div class="mb-3 grid gap-2">
+              <input type="file" id="image-upload" accept="image/*" class="mb-2 text-sm text-slate-300 file:mr-3 file:rounded-md file:border-0 file:bg-slate-700 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-cyan-100 hover:file:bg-slate-600">
+              <div class="flex items-center gap-3">
+                <button
+                  id="ocr-btn"
+                  type="button"
+                  class="rounded-lg border border-cyan-400/40 px-3 py-2 text-xs font-bold uppercase tracking-[0.16em] text-cyan-100 transition hover:bg-cyan-400/10 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
+                >
+                  Scan Image (OCR)
+                </button>
+                <span id="ocr-loading" class="hidden text-xs font-semibold uppercase tracking-[0.2em] text-amber-300">
+                  Scanning
+                </span>
+              </div>
+            </div>
+            <textarea
+              id="raw-text-input"
+              class="control-field min-h-28 resize-none text-sm"
+              placeholder="Paste airline engine-out chart text here..."
+            ></textarea>
+            <button
+              id="extract-btn"
+              type="button"
+              class="mt-3 w-full rounded-lg bg-cyan-400 px-4 py-2 text-sm font-bold uppercase tracking-[0.16em] text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+            >
+              Extract & Visualize
+            </button>
+            <button
+              id="verify-btn"
+              type="button"
+              class="hidden mt-3 w-full rounded-lg bg-emerald-400 px-4 py-2 text-sm font-bold uppercase tracking-[0.16em] text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+            >
+              Verify & Publish
+            </button>
+          </section>
+
+          <div
+            id="procedure-panel"
+            class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-slate-700 bg-slate-950/70 p-4"
+            role="status"
+            aria-live="polite"
+            data-display-state="idle"
+          >
+            <p class="text-sm text-slate-400">Select an emergency procedure to view status and instructions.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
