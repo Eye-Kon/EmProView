@@ -21,6 +21,7 @@ const elements = {
 };
 
 const RADAR_RANGE_NM = 20;
+const KSLC_16L_THRESHOLD = { latitude: 40.803, longitude: -111.977 };
 const canvasContext = elements.canvas.getContext("2d");
 
 async function loadProcedures() {
@@ -767,6 +768,14 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
   canvasContext.moveTo(currentPosition.x, currentPosition.y);
 
   segments.forEach((segment, index) => {
+    const cogoPath = drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY);
+
+    if (cogoPath) {
+      currentPosition = cogoPath.currentPosition;
+      finalHeadingRadians = cogoPath.finalHeadingRadians;
+      return;
+    }
+
     const resolvedHeading = resolveSegmentHeading(segment);
 
     if (resolvedHeading === null) {
@@ -795,6 +804,61 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
   if (segments.some((segment) => segment.segmentType === "hold")) {
     drawHoldPattern(currentPosition.x, currentPosition.y, strokeColor);
   }
+}
+
+function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY) {
+  const computedPoint = segment.computedSpatialTrigger?.computedTurnPoint;
+  const resultingAction = segment.computedSpatialTrigger?.resultingAction || segment.spatialTrigger?.resultingAction;
+  const outboundHeading = resultingAction?.magneticHeading;
+
+  if (!computedPoint || typeof outboundHeading !== "number" || Number.isNaN(outboundHeading)) {
+    return null;
+  }
+
+  const triggerPosition = geoPointToCanvasPosition(computedPoint, centerX, centerY, pixelsPerNM);
+  const headingRadians = degreesToRadians(outboundHeading);
+  const outboundDistance = 12 * pixelsPerNM;
+  const outboundPosition = {
+    x: triggerPosition.x + Math.sin(headingRadians) * outboundDistance,
+    y: triggerPosition.y - Math.cos(headingRadians) * outboundDistance
+  };
+  const turnDirection = resultingAction.turnDirection ? resultingAction.turnDirection.toUpperCase() : "TURN";
+
+  canvasContext.lineTo(triggerPosition.x, triggerPosition.y);
+  canvasContext.lineTo(outboundPosition.x, outboundPosition.y);
+  drawTurnJoint(triggerPosition, strokeColor);
+  drawSegmentLabel(triggerPosition, `${segment.label} ${turnDirection}`, labelColor);
+  drawSegmentLabel(outboundPosition, `${outboundHeading} deg`, labelColor);
+
+  return {
+    currentPosition: outboundPosition,
+    finalHeadingRadians: headingRadians
+  };
+}
+
+function geoPointToCanvasPosition(point, centerX, centerY, pixelsPerNM) {
+  const latitude = Number(point.latitude);
+  const longitude = Number(point.longitude);
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return { x: centerX, y: centerY };
+  }
+
+  const deltaNorthNm = (latitude - KSLC_16L_THRESHOLD.latitude) * 60;
+  const deltaEastNm =
+    (longitude - KSLC_16L_THRESHOLD.longitude) * 60 * Math.cos(degreesToRadians(KSLC_16L_THRESHOLD.latitude));
+
+  return {
+    x: centerX + deltaEastNm * pixelsPerNM,
+    y: centerY - deltaNorthNm * pixelsPerNM
+  };
+}
+
+function drawTurnJoint(position, strokeColor) {
+  canvasContext.save();
+  canvasContext.fillStyle = strokeColor;
+  canvasContext.fillRect(position.x - 4, position.y - 4, 8, 8);
+  canvasContext.restore();
 }
 
 function resolveSegmentHeading(segment) {
