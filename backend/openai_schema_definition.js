@@ -76,24 +76,24 @@ const procedureSchema = {
                                                 description: "Parametric COGO trigger for non-waypoint constraints. Use when the route is defined by a DME/radial/distance boundary instead of a named fix.",
                                                 properties: {
                                                     triggerType: {
-                                                        type: "string",
-                                                        enum: ["RADIAL_DISTANCE_INTERSECTION"],
+                                                        type: ["string", "null"],
+                                                        enum: ["RADIAL_DISTANCE_INTERSECTION", null],
                                                         description: "Use RADIAL_DISTANCE_INTERSECTION when an aircraft track intersects a DME radius from a reference NAVAID."
                                                     },
                                                     referenceNavaid: {
-                                                        type: "string",
+                                                        type: ["string", "null"],
                                                         description: "Reference NAVAID identifier, such as TCH."
                                                     },
                                                     triggerDistanceNM: {
-                                                        type: "number",
+                                                        type: ["number", "null"],
                                                         description: "DME distance in nautical miles from the reference NAVAID."
                                                     },
                                                     resultingAction: {
-                                                        type: "object",
+                                                        type: ["object", "null"],
                                                         properties: {
                                                             actionType: {
-                                                                type: "string",
-                                                                enum: ["TURN_HEADING", "DIRECT_TO_FIX", "TRACK_TO_FIX"],
+                                                                type: ["string", "null"],
+                                                                enum: ["TURN_HEADING", "DIRECT_TO_FIX", "TRACK_TO_FIX", null],
                                                                 description: "The action that begins at the computed trigger point."
                                                             },
                                                             turnDirection: {
@@ -118,7 +118,7 @@ const procedureSchema = {
                                                 description: "The physical length of this vector in Nautical Miles. MUST be null when the source text does not explicitly provide distance."
                                             }
                                         },
-                                        required: ["segmentType", "label", "distanceNM"],
+                                        required: ["segmentType", "label", "headingDegrees", "targetWaypoint", "terminationAltitude", "spatialTrigger", "distanceNM"],
                                         additionalProperties: false
                                     }
                                 }
