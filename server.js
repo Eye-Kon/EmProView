@@ -30,7 +30,7 @@ const upload = multer({
 const client = new MongoClient(process.env.MONGODB_URI);
 const KSLC_16L_THRESHOLD = { lat: 40.803, lon: -111.977 };
 const TCH_VOR = { lat: 40.850, lon: -111.980 };
-const KSLC_16L_TRUE_HEADING = 175;
+const KSLC_16L_MVP_AIRCRAFT_BEARING = 161;
 let db;
 
 async function connectDB() {
@@ -277,7 +277,6 @@ function enrichSegmentWithSpatialTrigger(segment, row) {
         return segment;
     }
 
-    const aircraftBearing = resolveAircraftBearing(segment, row);
     const referenceNavaid = segment.spatialTrigger.referenceNavaid;
     const dmeDistance = Number(segment.spatialTrigger.triggerDistanceNM);
 
@@ -285,7 +284,7 @@ function enrichSegmentWithSpatialTrigger(segment, row) {
         return segment;
     }
 
-    const turnPoint = calculateDmeIntersection(KSLC_16L_THRESHOLD, aircraftBearing, TCH_VOR, dmeDistance);
+    const turnPoint = calculateDmeIntersection(KSLC_16L_THRESHOLD, KSLC_16L_MVP_AIRCRAFT_BEARING, TCH_VOR, dmeDistance);
 
     return {
         ...segment,
@@ -311,7 +310,7 @@ function resolveAircraftBearing(segment, row) {
     }
 
     if (Array.isArray(row.runways) && row.runways.includes("16L")) {
-        return KSLC_16L_TRUE_HEADING;
+        return KSLC_16L_MVP_AIRCRAFT_BEARING;
     }
 
     throw new Error("RADIAL_DISTANCE_INTERSECTION requires an aircraft bearing.");

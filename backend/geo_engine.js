@@ -10,6 +10,8 @@ function calculateDmeIntersection(aircraftTrackOrigin, aircraftBearing, navaidCo
         throw new Error("Invalid bearing or DME distance supplied to geometry engine.");
     }
 
+    console.log("TURF AZIMUTH APPLIED:", bearing);
+
     const originPoint = turf.point(origin);
     const navaidPoint = turf.point(navaid);
     let bestCandidate = originPoint;
