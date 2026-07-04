@@ -6,6 +6,7 @@ const multer = require("multer");
 const OpenAI = require("openai");
 const path = require("path");
 const { procedureSchema } = require("./backend/openai_schema_definition");
+const { calculateDmeIntersection } = require("./backend/geo_engine");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
 
 const app = express();
@@ -27,6 +28,9 @@ const upload = multer({
 });
 
 const client = new MongoClient(process.env.MONGODB_URI);
+const KSLC_16L_THRESHOLD = { lat: 40.803, lon: -111.977 };
+const TCH_VOR = { lat: 40.850, lon: -111.980 };
+const KSLC_16L_MAGNETIC_HEADING = 160;
 let db;
 
 async function connectDB() {
@@ -110,7 +114,8 @@ app.post("/api/verify", requireAuth, async (req, res) => {
             }
         }
 
-        await db.collection("procedures").insertOne(incomingProcedure);
+        const enrichedProcedure = enrichProcedureWithSpatialTriggers(incomingProcedure);
+        await db.collection("procedures").insertOne(enrichedProcedure);
 
         return res.status(200).json({ ok: true });
     } catch (error) {
@@ -177,7 +182,7 @@ app.post("/api/extract", requireAuth, async (req, res) => {
         });
 
         const extractedProcedure = JSON.parse(response.choices[0].message.content);
-        return res.json(extractedProcedure);
+        return res.json(enrichProcedureWithSpatialTriggers(extractedProcedure));
     } catch (error) {
         console.error("OpenAI extraction failed:", error);
         return res.status(500).json({ error: "Failed to extract procedure data" });
@@ -248,6 +253,68 @@ function getAirportQuery(airportCode) {
             { "airport.icao": airportCode }
         ]
     };
+}
+
+function enrichProcedureWithSpatialTriggers(procedure) {
+    if (!procedure?.procedureRows) {
+        return procedure;
+    }
+
+    return {
+        ...procedure,
+        procedureRows: procedure.procedureRows.map((row) => ({
+            ...row,
+            geometry: {
+                ...row.geometry,
+                segments: (row.geometry?.segments || []).map((segment) => enrichSegmentWithSpatialTrigger(segment, row))
+            }
+        }))
+    };
+}
+
+function enrichSegmentWithSpatialTrigger(segment, row) {
+    if (segment?.spatialTrigger?.triggerType !== "RADIAL_DISTANCE_INTERSECTION") {
+        return segment;
+    }
+
+    const aircraftBearing = resolveAircraftBearing(segment, row);
+    const referenceNavaid = segment.spatialTrigger.referenceNavaid;
+    const dmeDistance = Number(segment.spatialTrigger.triggerDistanceNM);
+
+    if (referenceNavaid !== "TCH") {
+        return segment;
+    }
+
+    const turnPoint = calculateDmeIntersection(KSLC_16L_THRESHOLD, aircraftBearing, TCH_VOR, dmeDistance);
+
+    return {
+        ...segment,
+        computedSpatialTrigger: {
+            ...segment.spatialTrigger,
+            computedTurnPoint: turnPoint,
+            coordinateSource: "MVP_HARDCODED_KSLC_16L_TCH"
+        }
+    };
+}
+
+function resolveAircraftBearing(segment, row) {
+    const segmentBearing = Number(segment.headingDegrees);
+
+    if (Number.isFinite(segmentBearing)) {
+        return segmentBearing;
+    }
+
+    const rowBearing = Number(row.assignedHeadingDegrees);
+
+    if (Number.isFinite(rowBearing)) {
+        return rowBearing;
+    }
+
+    if (Array.isArray(row.runways) && row.runways.includes("16L")) {
+        return KSLC_16L_MAGNETIC_HEADING;
+    }
+
+    throw new Error("RADIAL_DISTANCE_INTERSECTION requires an aircraft bearing.");
 }
 
 function resolveSupportedImageMimeType(file) {

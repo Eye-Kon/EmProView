@@ -6,11 +6,11 @@
 
 const procedureSchema = {
     name: "engine_out_procedure_extraction",
-    description: "Extracts aircraft engine-out emergency procedures into strict ARINC-inspired navigation legs for radar visualization. Categorize each segment as HEADING_TO_ALTITUDE, DIRECT_TO_FIX, or TRACK_TO_FIX based only on chart text and visible map data.",
+    description: "Extracts aircraft engine-out emergency procedures into strict ARINC-inspired navigation legs and parametric COGO constraints for radar visualization.",
     strict: true,
     schema: {
         type: "object",
-        description: "Segment categorization rules: Use HEADING_TO_ALTITUDE for runway heading or assigned heading legs that terminate at an altitude. Use DIRECT_TO_FIX when the text says direct/proceed direct to a named fix. Use TRACK_TO_FIX when the chart shows a published route, VIA coding, SID/FMS/EO SID, or waypoint-to-waypoint sequence such as AA01R leading through map fixes.",
+        description: "Segment categorization rules: Use HEADING_TO_ALTITUDE for runway heading or assigned heading legs that terminate at an altitude or DME/radial boundary. Use DIRECT_TO_FIX when the text says direct/proceed direct to a named fix. Use TRACK_TO_FIX when the chart shows a published route, VIA coding, SID/FMS/EO SID, or waypoint-to-waypoint sequence such as AA01R leading through map fixes. If the text says maintain runway heading until a DME from a NAVAID, encode that as a spatialTrigger with triggerType RADIAL_DISTANCE_INTERSECTION.",
         properties: {
             procedureType: {
                 type: "string",
@@ -48,7 +48,7 @@ const procedureSchema = {
                                     description: "Sequential navigation legs. If the VIA column contains a coded route such as AA01R, EO08, or similar, and the map depicts a chain of waypoints, encode the route as TRACK_TO_FIX segments in displayed order.",
                                     items: {
                                         type: "object",
-                                        description: "A polymorphic navigation leg inspired by ARINC 424 path terminators. Segment type determines which optional fields must be populated.",
+                                        description: "A polymorphic navigation leg inspired by ARINC 424 path terminators and COGO constraints. For text like 'Maintain runway heading until 11.6 DME from the TCH VOR, then turn left heading 320', use HEADING_TO_ALTITUDE or TRACK_TO_FIX as appropriate and include a spatialTrigger with triggerType RADIAL_DISTANCE_INTERSECTION.",
                                         properties: {
                                             segmentType: {
                                                 type: "string",
@@ -65,11 +65,53 @@ const procedureSchema = {
                                             },
                                             targetWaypoint: {
                                                 type: ["string", "null"],
-                                                description: "Required when segmentType is DIRECT_TO_FIX or TRACK_TO_FIX. The named fix or waypoint that terminates this leg. Use null for HEADING_TO_ALTITUDE if no waypoint terminates the leg."
+                                                description: "The named fix or waypoint that terminates this leg. Use for DIRECT_TO_FIX or TRACK_TO_FIX when a waypoint is present; use null for DME/radial-only terminations."
                                             },
                                             terminationAltitude: {
                                                 type: ["number", "null"],
                                                 description: "Optional altitude boundary for the leg. Required by meaning for HEADING_TO_ALTITUDE when the chart states an altitude termination; otherwise use null."
+                                            },
+                                            spatialTrigger: {
+                                                type: ["object", "null"],
+                                                description: "Parametric COGO trigger for non-waypoint constraints. Use when the route is defined by a DME/radial/distance boundary instead of a named fix.",
+                                                properties: {
+                                                    triggerType: {
+                                                        type: "string",
+                                                        enum: ["RADIAL_DISTANCE_INTERSECTION"],
+                                                        description: "Use RADIAL_DISTANCE_INTERSECTION when an aircraft track intersects a DME radius from a reference NAVAID."
+                                                    },
+                                                    referenceNavaid: {
+                                                        type: "string",
+                                                        description: "Reference NAVAID identifier, such as TCH."
+                                                    },
+                                                    triggerDistanceNM: {
+                                                        type: "number",
+                                                        description: "DME distance in nautical miles from the reference NAVAID."
+                                                    },
+                                                    resultingAction: {
+                                                        type: "object",
+                                                        properties: {
+                                                            actionType: {
+                                                                type: "string",
+                                                                enum: ["TURN_HEADING", "DIRECT_TO_FIX", "TRACK_TO_FIX"],
+                                                                description: "The action that begins at the computed trigger point."
+                                                            },
+                                                            turnDirection: {
+                                                                type: ["string", "null"],
+                                                                enum: ["left", "right", "not_applicable", null],
+                                                                description: "Turn direction if stated."
+                                                            },
+                                                            magneticHeading: {
+                                                                type: ["number", "null"],
+                                                                description: "Resulting magnetic heading, such as 320."
+                                                            }
+                                                        },
+                                                        required: ["actionType", "turnDirection", "magneticHeading"],
+                                                        additionalProperties: false
+                                                    }
+                                                },
+                                                required: ["triggerType", "referenceNavaid", "triggerDistanceNM", "resultingAction"],
+                                                additionalProperties: false
                                             },
                                             distanceNM: {
                                                 type: ["number", "null"],
@@ -77,28 +119,6 @@ const procedureSchema = {
                                             }
                                         },
                                         required: ["segmentType", "label", "distanceNM"],
-                                        allOf: [
-                                            {
-                                                if: {
-                                                    properties: {
-                                                        segmentType: { const: "HEADING_TO_ALTITUDE" }
-                                                    }
-                                                },
-                                                then: {
-                                                    required: ["headingDegrees"]
-                                                }
-                                            },
-                                            {
-                                                if: {
-                                                    properties: {
-                                                        segmentType: { enum: ["DIRECT_TO_FIX", "TRACK_TO_FIX"] }
-                                                    }
-                                                },
-                                                then: {
-                                                    required: ["targetWaypoint"]
-                                                }
-                                            }
-                                        ],
                                         additionalProperties: false
                                     }
                                 }
