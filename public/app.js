@@ -761,16 +761,22 @@ function drawProcedureVector(procedure, centerX, centerY, pixelsPerNM) {
 function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, labelColor, pixelsPerNM) {
   let currentPosition = { x: centerX, y: centerY };
   let finalHeadingRadians = 0;
+  let pathHasDrawableSegments = false;
+  let pathIsOpen = false;
 
   canvasContext.strokeStyle = strokeColor;
   canvasContext.lineWidth = 3;
-  canvasContext.beginPath();
-  canvasContext.moveTo(currentPosition.x, currentPosition.y);
 
-  segments.forEach((segment, index) => {
+  segments.forEach((segment) => {
     const cogoPath = drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY);
 
     if (cogoPath) {
+      if (pathIsOpen && pathHasDrawableSegments) {
+        canvasContext.stroke();
+        pathIsOpen = false;
+        pathHasDrawableSegments = false;
+      }
+
       currentPosition = cogoPath.currentPosition;
       finalHeadingRadians = cogoPath.finalHeadingRadians;
       return;
@@ -783,6 +789,12 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
       return;
     }
 
+    if (!pathIsOpen) {
+      canvasContext.beginPath();
+      canvasContext.moveTo(currentPosition.x, currentPosition.y);
+      pathIsOpen = true;
+    }
+
     const headingRadians = degreesToRadians(resolvedHeading);
     const distanceNM = getSegmentDistanceNM(segment);
     const distance = distanceNM * pixelsPerNM;
@@ -793,13 +805,16 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
 
     canvasContext.lineTo(nextPosition.x, nextPosition.y);
     drawSegmentLabel(nextPosition, segment.label, labelColor);
+    pathHasDrawableSegments = true;
 
     currentPosition = nextPosition;
     finalHeadingRadians = headingRadians;
   });
 
-  canvasContext.stroke();
-  drawArrowHead(currentPosition.x, currentPosition.y, finalHeadingRadians - Math.PI / 2, strokeColor);
+  if (pathIsOpen && pathHasDrawableSegments) {
+    canvasContext.stroke();
+    drawArrowHead(currentPosition.x, currentPosition.y, finalHeadingRadians - Math.PI / 2, strokeColor);
+  }
 
   if (segments.some((segment) => segment.segmentType === "hold")) {
     drawHoldPattern(currentPosition.x, currentPosition.y, strokeColor);
@@ -809,7 +824,7 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
 function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY) {
   const computedPoint = segment.computedSpatialTrigger?.computedTurnPoint;
   const resultingAction = segment.computedSpatialTrigger?.resultingAction || segment.spatialTrigger?.resultingAction;
-  const outboundHeading = resultingAction?.magneticHeading;
+  const outboundHeading = Number(resultingAction?.magneticHeading);
 
   if (!computedPoint || typeof outboundHeading !== "number" || Number.isNaN(outboundHeading)) {
     return null;
@@ -824,8 +839,17 @@ function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pix
   };
   const turnDirection = resultingAction.turnDirection ? resultingAction.turnDirection.toUpperCase() : "TURN";
 
+  canvasContext.save();
+  canvasContext.strokeStyle = strokeColor;
+  canvasContext.lineWidth = 3;
+  canvasContext.beginPath();
+  canvasContext.moveTo(currentPosition.x, currentPosition.y);
   canvasContext.lineTo(triggerPosition.x, triggerPosition.y);
   canvasContext.lineTo(outboundPosition.x, outboundPosition.y);
+  canvasContext.stroke();
+  canvasContext.restore();
+
+  drawArrowHead(outboundPosition.x, outboundPosition.y, headingRadians - Math.PI / 2, strokeColor);
   drawTurnJoint(triggerPosition, strokeColor);
   drawSegmentLabel(triggerPosition, `${segment.label} ${turnDirection}`, labelColor);
   drawSegmentLabel(outboundPosition, `${outboundHeading} deg`, labelColor);
