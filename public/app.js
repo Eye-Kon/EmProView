@@ -324,16 +324,18 @@ function setOcrLoading(isLoading) {
 function normalizeExtractedProcedure(extractedProcedure) {
   const airportCode = extractedProcedure.airportCode || "UNKNOWN";
   const airportIata = airportCode.length === 4 && airportCode.startsWith("K") ? airportCode.slice(1) : airportCode;
+  const airlineName = extractedProcedure.airline || "AI Extracted Procedure";
+  const aircraft = extractedProcedure.aircraft || "UNKNOWN";
 
   return {
     id: `ai-extracted-${Date.now()}`,
     airline: {
-      name: "AI Extracted Procedure",
+      name: airlineName,
       icao: "AI"
     },
     source: {
       airportCode,
-      chartTitle: "Live AI Extraction",
+      chartTitle: extractedProcedure.procedureType || "Live AI Extraction",
       chartDate: new Date().toISOString().slice(0, 10),
       sourceType: "ai_structured_output"
     },
@@ -347,7 +349,8 @@ function normalizeExtractedProcedure(extractedProcedure) {
     },
     procedureType: extractedProcedure.procedureType,
     operation: "ai_extraction",
-    applicableAircraft: ["UNKNOWN"],
+    aircraft,
+    applicableAircraft: [aircraft],
     verification: {
       status: "ai_unverified",
       humanReviewed: false,
@@ -604,12 +607,20 @@ function renderProcedurePanel(procedure) {
       </div>
       <div class="rounded-lg bg-slate-900/80 p-3">
         <p class="text-xs uppercase tracking-[0.2em] text-slate-500">Aircraft</p>
-        <p class="mt-1 text-slate-100">${procedure.applicableAircraft.join(", ")}</p>
+        <p class="mt-1 text-slate-100">${getAircraftDisplay(procedure)}</p>
       </div>
     </div>
 
     <div class="space-y-3">${rows}</div>
   `;
+}
+
+function getAircraftDisplay(procedure) {
+  if (typeof procedure.aircraft === "string" && procedure.aircraft.trim() !== "") {
+    return procedure.aircraft;
+  }
+
+  return procedure.applicableAircraft.join(", ");
 }
 
 function resetProcedureDisplayState() {
@@ -900,8 +911,11 @@ function geoPointToCanvasPosition(point, centerX, centerY, pixelsPerNM) {
 
 function drawTurnJoint(position, strokeColor) {
   canvasContext.save();
-  canvasContext.fillStyle = strokeColor;
-  canvasContext.fillRect(position.x - 4, position.y - 4, 8, 8);
+  canvasContext.strokeStyle = strokeColor;
+  canvasContext.lineWidth = 2;
+  canvasContext.beginPath();
+  canvasContext.arc(position.x, position.y, 5, 0, Math.PI * 2);
+  canvasContext.stroke();
   canvasContext.restore();
 }
 
@@ -984,13 +998,13 @@ function drawArrowHead(x, y, radians, color) {
   canvasContext.save();
   canvasContext.translate(x, y);
   canvasContext.rotate(radians);
-  canvasContext.fillStyle = color;
+  canvasContext.strokeStyle = color;
+  canvasContext.lineWidth = 3;
   canvasContext.beginPath();
-  canvasContext.moveTo(0, 0);
-  canvasContext.lineTo(-12, -6);
+  canvasContext.moveTo(-12, -6);
+  canvasContext.lineTo(0, 0);
   canvasContext.lineTo(-12, 6);
-  canvasContext.closePath();
-  canvasContext.fill();
+  canvasContext.stroke();
   canvasContext.restore();
 }
 

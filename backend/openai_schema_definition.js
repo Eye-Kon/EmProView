@@ -12,10 +12,17 @@ const procedureSchema = {
         type: "object",
         description: "Segment categorization rules: Use HEADING_TO_ALTITUDE for runway heading or assigned heading legs that terminate at an altitude or DME/radial boundary. Use DIRECT_TO_FIX when the text says direct/proceed direct to a named fix. Use TRACK_TO_FIX when the chart shows a published route, VIA coding, SID/FMS/EO SID, or waypoint-to-waypoint sequence such as AA01R leading through map fixes. If the text says maintain runway heading until a DME from a NAVAID, encode that as a spatialTrigger with triggerType RADIAL_DISTANCE_INTERSECTION.",
         properties: {
+            airline: {
+                type: "string",
+                description: "The operating airline from the chart header, such as American Airlines or Delta."
+            },
             procedureType: {
                 type: "string",
-                enum: ["heading_turn", "conditional_route", "rnav_sequence"],
-                description: "The primary mathematical classification of the procedure."
+                description: "The specific procedure type or mathematical classification, such as Engine Failure Takeoff, Missed Approach, heading_turn, conditional_route, or rnav_sequence."
+            },
+            aircraft: {
+                type: "string",
+                description: "Aircraft applicability from the chart header or margins, such as ALL AIRCRAFT, A32F, 737 / 777 / 787."
             },
             airportCode: {
                 type: "string",
@@ -132,7 +139,7 @@ const procedureSchema = {
                 }
             }
         },
-        required: ["procedureType", "airportCode", "procedureRows"],
+        required: ["airline", "procedureType", "aircraft", "airportCode", "procedureRows"],
         additionalProperties: false
     }
 };
