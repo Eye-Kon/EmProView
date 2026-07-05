@@ -822,6 +822,8 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
 }
 
 function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY) {
+  console.log("CANVAS RENDERER EXECUTING NEW PATH LOGIC");
+
   const computedPoint = segment.computedSpatialTrigger?.computedTurnPoint;
   const resultingAction = segment.computedSpatialTrigger?.resultingAction || segment.spatialTrigger?.resultingAction;
   const outboundHeading = Number(resultingAction?.magneticHeading);
@@ -838,14 +840,32 @@ function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pix
     y: triggerPosition.y - Math.cos(headingRadians) * outboundDistance
   };
   const turnDirection = resultingAction.turnDirection ? resultingAction.turnDirection.toUpperCase() : "TURN";
+  const runwayX = currentPosition.x;
+  const runwayY = currentPosition.y;
+  const turnPointX = triggerPosition.x;
+  const turnPointY = triggerPosition.y;
+  const outboundEndX = outboundPosition.x;
+  const outboundEndY = outboundPosition.y;
 
   canvasContext.save();
   canvasContext.strokeStyle = strokeColor;
   canvasContext.lineWidth = 3;
   canvasContext.beginPath();
-  canvasContext.moveTo(currentPosition.x, currentPosition.y);
-  canvasContext.lineTo(triggerPosition.x, triggerPosition.y);
-  canvasContext.lineTo(outboundPosition.x, outboundPosition.y);
+  // 1. Start at Runway
+  canvasContext.moveTo(runwayX, runwayY);
+
+  // 2. Draw line to the spatial trigger (11.6 DME)
+  if (Number.isFinite(turnPointX) && Number.isFinite(turnPointY)) {
+    canvasContext.lineTo(turnPointX, turnPointY);
+
+    // 3. CRITICAL: Do NOT close the path. Project the outbound heading FROM the turn point.
+    if (Number.isFinite(outboundEndX) && Number.isFinite(outboundEndY)) {
+      // Move the pen explicitly to the turn point just to be safe
+      canvasContext.moveTo(turnPointX, turnPointY);
+      // Draw the outbound leg
+      canvasContext.lineTo(outboundEndX, outboundEndY);
+    }
+  }
   canvasContext.stroke();
   canvasContext.restore();
 

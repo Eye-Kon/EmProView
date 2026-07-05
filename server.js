@@ -170,6 +170,8 @@ app.post("/api/extract", requireAuth, async (req, res) => {
     try {
         const response = await openai.chat.completions.create({
             model: "gpt-4o", // Upgraded from specific 08-06 tag for broader vision/text consistency
+            temperature: 0,
+            top_p: 0.1,
             messages: [
                 { role: "system", content: systemInstructions },
                 ...fewShotExamples,
@@ -214,6 +216,8 @@ app.post("/api/ocr", requireAuth, (req, res, next) => {
         const base64Image = req.file.buffer.toString("base64");
         const response = await openai.chat.completions.create({
             model: "gpt-4o",
+            temperature: 0,
+            top_p: 0.1,
             messages: [
                 {
                     role: "user",
