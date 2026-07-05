@@ -860,20 +860,12 @@ function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pix
 
   canvasContext.save();
   canvasContext.strokeStyle = strokeColor;
-  canvasContext.lineWidth = 3;
+  canvasContext.lineWidth = 2;
   canvasContext.beginPath();
-  // 1. Start at Runway
   canvasContext.moveTo(runwayX, runwayY);
-
-  // 2. Draw line to the spatial trigger (11.6 DME)
   if (Number.isFinite(turnPointX) && Number.isFinite(turnPointY)) {
     canvasContext.lineTo(turnPointX, turnPointY);
-
-    // 3. CRITICAL: Do NOT close the path. Project the outbound heading FROM the turn point.
     if (Number.isFinite(outboundEndX) && Number.isFinite(outboundEndY)) {
-      // Move the pen explicitly to the turn point just to be safe
-      canvasContext.moveTo(turnPointX, turnPointY);
-      // Draw the outbound leg
       canvasContext.lineTo(outboundEndX, outboundEndY);
     }
   }
@@ -998,13 +990,13 @@ function drawArrowHead(x, y, radians, color) {
   canvasContext.save();
   canvasContext.translate(x, y);
   canvasContext.rotate(radians);
-  canvasContext.strokeStyle = color;
-  canvasContext.lineWidth = 3;
+  canvasContext.fillStyle = color;
   canvasContext.beginPath();
-  canvasContext.moveTo(-12, -6);
-  canvasContext.lineTo(0, 0);
+  canvasContext.moveTo(0, 0);
+  canvasContext.lineTo(-12, -6);
   canvasContext.lineTo(-12, 6);
-  canvasContext.stroke();
+  canvasContext.fill();
+  canvasContext.closePath();
   canvasContext.restore();
 }
 
