@@ -3,21 +3,103 @@ const { getNavaid, getRunway } = require("../utils/navDbQuery");
 
 const EARTH_RADIUS_METERS = 6371008.8;
 const NM_TO_METERS = 1852;
+const BEARING_ALIGNMENT_TOLERANCE_DEGREES = 1;
+const DME_TOLERANCE_NM = 0.001;
 
-function calculateTrackCircleIntersection(aircraftTrackOrigin, aircraftBearing, navaidCoords, triggerDistanceNM) {
+function calculateTrackCircleIntersection(aircraftTrackOrigin, trueHeading, navaidCoords, triggerDistanceNM) {
     const origin = toLngLat(aircraftTrackOrigin);
     const navaid = toLngLat(navaidCoords);
-    const bearing = Number(aircraftBearing);
+    const departureBearing = normalizeBearing(Number(trueHeading));
     const radiusNm = Number(triggerDistanceNM);
 
-    if (!Number.isFinite(bearing) || !Number.isFinite(radiusNm)) {
+    if (!Number.isFinite(departureBearing) || !Number.isFinite(radiusNm)) {
         throw new Error("Invalid bearing or trigger distance supplied to geometry engine.");
     }
 
     const originPoint = turf.point(origin);
     const navaidPoint = turf.point(navaid);
+    const trackDistancesNm = solveTrackDistancesToCircle(
+        originPoint,
+        navaidPoint,
+        departureBearing,
+        radiusNm
+    );
+
+    let bestForwardIntersection = null;
+
+    for (const trackDistanceNm of trackDistancesNm) {
+        const candidatePoint = projectAlongTrueHeading(originPoint, trackDistanceNm, departureBearing);
+
+        if (!isForwardAlongDepartureBearing(originPoint, candidatePoint, departureBearing)) {
+            continue;
+        }
+
+        const dmeErrorNm = Math.abs(
+            turf.distance(candidatePoint, navaidPoint, { units: "nauticalmiles" }) - radiusNm
+        );
+
+        if (dmeErrorNm > DME_TOLERANCE_NM) {
+            continue;
+        }
+
+        if (
+            bestForwardIntersection === null ||
+            trackDistanceNm < bestForwardIntersection.distanceAlongTrackNM
+        ) {
+            bestForwardIntersection = {
+                point: candidatePoint,
+                distanceAlongTrackNM: trackDistanceNm,
+                dmeErrorNM: dmeErrorNm
+            };
+        }
+    }
+
+    if (bestForwardIntersection === null) {
+        throw new Error("No forward track intersection found on the DME arc.");
+    }
+
+    const [longitude, latitude] = bestForwardIntersection.point.geometry.coordinates;
+
+    return {
+        latitude,
+        longitude,
+        distanceAlongTrackNM: Number(bestForwardIntersection.distanceAlongTrackNM.toFixed(1)),
+        dmeErrorNM: Number(bestForwardIntersection.dmeErrorNM.toFixed(3))
+    };
+}
+
+function computeRadialDistanceTurnPoint(runwayIdentifier, navaidIdentifier, triggerDistanceNM) {
+    const runway = getRunway(runwayIdentifier);
+    const navaid = getNavaid(navaidIdentifier);
+
+    return calculateTrackCircleIntersection(
+        { latitude: runway.latitude, longitude: runway.longitude },
+        runway.trueHeading,
+        { latitude: navaid.latitude, longitude: navaid.longitude },
+        triggerDistanceNM
+    );
+}
+
+function projectAlongTrueHeading(originPoint, distanceNm, trueHeading) {
+    return turf.destination(originPoint, distanceNm, trueHeading, { units: "nauticalmiles" });
+}
+
+function isForwardAlongDepartureBearing(originPoint, candidatePoint, departureBearing) {
+    const distanceFromOriginNm = turf.distance(originPoint, candidatePoint, { units: "nauticalmiles" });
+
+    if (distanceFromOriginNm <= DME_TOLERANCE_NM) {
+        return false;
+    }
+
+    const bearingToCandidate = normalizeBearing(turf.bearing(originPoint, candidatePoint));
+    const bearingDelta = Math.abs(normalizeBearingDelta(bearingToCandidate - departureBearing));
+
+    return bearingDelta <= BEARING_ALIGNMENT_TOLERANCE_DEGREES;
+}
+
+function solveTrackDistancesToCircle(originPoint, navaidPoint, departureBearing, radiusNm) {
     const bearingToNavaid = turf.bearing(originPoint, navaidPoint);
-    const trackAngleRad = degreesToRadians(normalizeBearingDelta(bearingToNavaid - bearing));
+    const trackAngleRad = degreesToRadians(normalizeBearingDelta(bearingToNavaid - departureBearing));
     const distanceToNavaidNm = turf.distance(originPoint, navaidPoint, { units: "nauticalmiles" });
     const onRad = nmToRadians(distanceToNavaidNm);
     const rhoRad = nmToRadians(radiusNm);
@@ -25,67 +107,19 @@ function calculateTrackCircleIntersection(aircraftTrackOrigin, aircraftBearing, 
     const cosOn = Math.cos(onRad);
     const sinOn = Math.sin(onRad);
     const cosTheta = Math.cos(trackAngleRad);
-    const B = cosOn;
-    const C = sinOn * cosTheta;
-    const divisor = Math.hypot(B, C);
-    const ratio = cosRho / divisor;
+    const amplitude = Math.hypot(cosOn, sinOn * cosTheta);
+    const ratio = cosRho / amplitude;
 
     if (Math.abs(ratio) > 1) {
         throw new Error("Track does not intersect the DME arc at the requested radius.");
     }
 
-    const phi = Math.atan2(C, B);
+    const phase = Math.atan2(sinOn * cosTheta, cosOn);
     const angularOffset = Math.acos(ratio);
-    const candidateSigmasRad = [phi + angularOffset, phi - angularOffset];
-    let bestSigmaRad = null;
 
-    for (const sigmaRad of candidateSigmasRad) {
-        if (sigmaRad <= 0) {
-            continue;
-        }
-
-        const sigmaNm = radiansToNm(sigmaRad);
-        const candidatePoint = turf.destination(originPoint, sigmaNm, bearing, { units: "nauticalmiles" });
-        const distanceToNavaidError = Math.abs(
-            turf.distance(candidatePoint, navaidPoint, { units: "nauticalmiles" }) - radiusNm
-        );
-
-        if (distanceToNavaidError > 0.001) {
-            continue;
-        }
-
-        if (bestSigmaRad === null || sigmaRad < bestSigmaRad) {
-            bestSigmaRad = sigmaRad;
-        }
-    }
-
-    if (bestSigmaRad === null) {
-        throw new Error("No forward track intersection found on the DME arc.");
-    }
-
-    const distanceAlongTrackNM = radiansToNm(bestSigmaRad);
-    const intersectionPoint = turf.destination(originPoint, distanceAlongTrackNM, bearing, { units: "nauticalmiles" });
-    const [longitude, latitude] = intersectionPoint.geometry.coordinates;
-
-    return {
-        latitude,
-        longitude,
-        distanceAlongTrackNM: Number(distanceAlongTrackNM.toFixed(1)),
-        dmeErrorNM: 0
-    };
-}
-
-function computeRadialDistanceTurnPoint(runwayIdentifier, navaidIdentifier, triggerDistanceNM, aircraftBearing) {
-    const runway = getRunway(runwayIdentifier);
-    const navaid = getNavaid(navaidIdentifier);
-    const bearing = Number.isFinite(Number(aircraftBearing)) ? Number(aircraftBearing) : runway.trueHeading;
-
-    return calculateTrackCircleIntersection(
-        { latitude: runway.latitude, longitude: runway.longitude },
-        bearing,
-        { latitude: navaid.latitude, longitude: navaid.longitude },
-        triggerDistanceNM
-    );
+    return [phase + angularOffset, phase - angularOffset]
+        .map((sigmaRad) => radiansToNm(sigmaRad))
+        .filter((sigmaNm) => sigmaNm > DME_TOLERANCE_NM);
 }
 
 function nmToRadians(distanceNm) {
@@ -98,6 +132,16 @@ function radiansToNm(angleRadians) {
 
 function degreesToRadians(degrees) {
     return (degrees * Math.PI) / 180;
+}
+
+function normalizeBearing(bearing) {
+    let normalized = bearing % 360;
+
+    if (normalized < 0) {
+        normalized += 360;
+    }
+
+    return normalized;
 }
 
 function normalizeBearingDelta(deltaDegrees) {

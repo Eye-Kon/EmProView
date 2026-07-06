@@ -7,7 +7,6 @@ const OpenAI = require("openai");
 const path = require("path");
 const { procedureSchema } = require("./backend/openai_schema_definition");
 const { computeRadialDistanceTurnPoint } = require("./backend/geo_engine");
-const { getRunway } = require("./utils/navDbQuery");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
 
 const app = express();
@@ -286,8 +285,7 @@ function enrichSegmentWithSpatialTrigger(segment, row) {
         return segment;
     }
 
-    const aircraftBearing = resolveAircraftBearing(segment, row);
-    const turnPoint = computeRadialDistanceTurnPoint("KSLC_16L", referenceNavaid, dmeDistance, aircraftBearing);
+    const turnPoint = computeRadialDistanceTurnPoint("KSLC_16L", referenceNavaid, dmeDistance);
 
     return {
         ...segment,
@@ -296,26 +294,6 @@ function enrichSegmentWithSpatialTrigger(segment, row) {
             computedTurnPoint: turnPoint
         }
     };
-}
-
-function resolveAircraftBearing(segment, row) {
-    const segmentBearing = Number(segment.headingDegrees);
-
-    if (Number.isFinite(segmentBearing)) {
-        return segmentBearing;
-    }
-
-    const rowBearing = Number(row.assignedHeadingDegrees);
-
-    if (Number.isFinite(rowBearing)) {
-        return rowBearing;
-    }
-
-    if (Array.isArray(row.runways) && row.runways.includes("16L")) {
-        return getRunway("KSLC_16L").trueHeading;
-    }
-
-    throw new Error("RADIAL_DISTANCE_INTERSECTION requires an aircraft bearing.");
 }
 
 function resolveSupportedImageMimeType(file) {
