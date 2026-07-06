@@ -1,0 +1,18 @@
+{
+  "navaids": {
+    "TCH": {
+      "name": "Wasatch VOR",
+      "latitude": 40.8522,
+      "longitude": -111.9806,
+      "elevation": 4220,
+      "type": "VORTAC"
+    }
+  },
+  "runways": {
+    "KSLC_16L": {
+      "latitude": 40.803,
+      "longitude": -111.977,
+      "trueHeading": 174.5
+    }
+  }
+}

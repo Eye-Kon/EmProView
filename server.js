@@ -6,7 +6,8 @@ const multer = require("multer");
 const OpenAI = require("openai");
 const path = require("path");
 const { procedureSchema } = require("./backend/openai_schema_definition");
-const { calculateDmeIntersection } = require("./backend/geo_engine");
+const { computeRadialDistanceTurnPoint } = require("./backend/geo_engine");
+const { getRunway } = require("./utils/navDbQuery");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
 
 const app = express();
@@ -28,9 +29,6 @@ const upload = multer({
 });
 
 const client = new MongoClient(process.env.MONGODB_URI);
-const KSLC_16L_THRESHOLD = { lat: 40.803, lon: -111.977 };
-const TCH_VOR = { lat: 40.850, lon: -111.980 };
-const KSLC_16L_MVP_AIRCRAFT_BEARING = 161;
 let db;
 
 async function connectDB() {
@@ -288,14 +286,14 @@ function enrichSegmentWithSpatialTrigger(segment, row) {
         return segment;
     }
 
-    const turnPoint = calculateDmeIntersection(KSLC_16L_THRESHOLD, KSLC_16L_MVP_AIRCRAFT_BEARING, TCH_VOR, dmeDistance);
+    const aircraftBearing = resolveAircraftBearing(segment, row);
+    const turnPoint = computeRadialDistanceTurnPoint("KSLC_16L", referenceNavaid, dmeDistance, aircraftBearing);
 
     return {
         ...segment,
         computedSpatialTrigger: {
             ...segment.spatialTrigger,
-            computedTurnPoint: turnPoint,
-            coordinateSource: "MVP_HARDCODED_KSLC_16L_TCH"
+            computedTurnPoint: turnPoint
         }
     };
 }
@@ -314,7 +312,7 @@ function resolveAircraftBearing(segment, row) {
     }
 
     if (Array.isArray(row.runways) && row.runways.includes("16L")) {
-        return KSLC_16L_MVP_AIRCRAFT_BEARING;
+        return getRunway("KSLC_16L").trueHeading;
     }
 
     throw new Error("RADIAL_DISTANCE_INTERSECTION requires an aircraft bearing.");
