@@ -6,7 +6,7 @@ const multer = require("multer");
 const OpenAI = require("openai");
 const path = require("path");
 const { procedureSchema } = require("./backend/openai_schema_definition");
-const { computeRadialDistanceTurnPoint } = require("./backend/geo_engine");
+const { segmentProcessor, DataIntegrityError } = require("./backend/geo_engine");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
 
 const app = express();
@@ -112,6 +112,22 @@ app.post("/api/verify", requireAuth, async (req, res) => {
         }
 
         const enrichedProcedure = enrichProcedureWithSpatialTriggers(incomingProcedure);
+
+        // Publication gate: extraction previews may carry partial results, but a
+        // published procedure must have every row's geometry fully resolved.
+        const failedRows = enrichedProcedure.procedureRows.filter((row) => row.integrity?.status === "failed");
+
+        if (failedRows.length > 0) {
+            return res.status(422).json({
+                error: "Cannot publish: one or more rows failed geometry enrichment.",
+                failures: failedRows.map((row) => ({
+                    rowId: row.rowId,
+                    runways: row.runways,
+                    errors: row.integrity.errors
+                }))
+            });
+        }
+
         await db.collection("procedures").insertOne(enrichedProcedure);
 
         return res.status(200).json({ ok: true });
@@ -243,7 +259,13 @@ async function seedDatabase() {
 }
 
 function getProcedureAirportCode(procedure) {
-    return procedure.airportCode || procedure.source?.airportCode || procedure.airport?.icao || "UNKNOWN";
+    const airportCode = procedure.airportCode || procedure.source?.airportCode || procedure.airport?.icao;
+
+    if (typeof airportCode !== "string" || airportCode.trim() === "") {
+        throw new DataIntegrityError("Procedure airportCode is required for spatial trigger resolution.");
+    }
+
+    return airportCode.trim();
 }
 
 function getAirportQuery(airportCode) {
@@ -261,38 +283,58 @@ function enrichProcedureWithSpatialTriggers(procedure) {
         return procedure;
     }
 
+    const airportCode = getProcedureAirportCode(procedure);
+
+    // Per-row enrichment: a ground-truth gap in one row (e.g. a runway missing
+    // from the nav database) must not abort the entire procedure. Each row
+    // carries its own integrity report; failed rows keep their raw segments.
     return {
         ...procedure,
-        procedureRows: procedure.procedureRows.map((row) => ({
-            ...row,
-            geometry: {
-                ...row.geometry,
-                segments: (row.geometry?.segments || []).map((segment) => enrichSegmentWithSpatialTrigger(segment, row))
+        procedureRows: procedure.procedureRows.map((row) => {
+            try {
+                return {
+                    ...row,
+                    geometry: {
+                        ...row.geometry,
+                        segments: (row.geometry?.segments || []).map((segment) =>
+                            enrichSegmentWithSpatialTrigger(segment, row, { airportCode })
+                        )
+                    },
+                    integrity: { status: "enriched", errors: [] }
+                };
+            } catch (error) {
+                if (!(error instanceof DataIntegrityError)) {
+                    throw error;
+                }
+
+                console.warn(`Row ${row.rowId || "(unidentified)"} enrichment failed: ${error.message}`);
+
+                return {
+                    ...row,
+                    integrity: {
+                        status: "failed",
+                        errors: [`${error.name}: ${error.message}`]
+                    }
+                };
             }
-        }))
+        })
     };
 }
 
-function enrichSegmentWithSpatialTrigger(segment, row) {
-    if (segment?.spatialTrigger?.triggerType !== "RADIAL_DISTANCE_INTERSECTION") {
+function enrichSegmentWithSpatialTrigger(segment, row, context) {
+    if (!segment?.spatialTrigger) {
         return segment;
     }
 
-    const referenceNavaid = segment.spatialTrigger.referenceNavaid;
-    const dmeDistance = Number(segment.spatialTrigger.triggerDistanceNM);
+    const computedSpatialTrigger = segmentProcessor.process(segment, row, context);
 
-    if (referenceNavaid !== "TCH") {
+    if (!computedSpatialTrigger) {
         return segment;
     }
-
-    const turnPoint = computeRadialDistanceTurnPoint("KSLC_16L", referenceNavaid, dmeDistance);
 
     return {
         ...segment,
-        computedSpatialTrigger: {
-            ...segment.spatialTrigger,
-            computedTurnPoint: turnPoint
-        }
+        computedSpatialTrigger
     };
 }
 

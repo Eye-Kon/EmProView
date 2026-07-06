@@ -21,8 +21,15 @@ const elements = {
 };
 
 const RADAR_RANGE_NM = 20;
-const KSLC_16L_THRESHOLD = { latitude: 40.803, longitude: -111.977 };
+// Display parameters in real-world units so all geometry scales with pixelsPerNM (zoom).
+// Used only by the legacy telemetry-arc fallback; backend path artifacts carry their own geometry.
+const TURN_RADIUS_NM = 1.5;
+const OUTBOUND_LEG_NM = 12;
 const canvasContext = elements.canvas.getContext("2d");
+
+// WGS-84 anchor for canvas projection, derived from the displayed procedure's
+// own geometry (its runway threshold). Never hardcoded to a specific airport.
+let activeProjectionAnchor = null;
 
 async function loadProcedures() {
   try {
@@ -567,6 +574,13 @@ function renderProcedurePanel(procedure) {
     .map((row) => {
       const heading =
         row.assignedHeadingDegrees > 0 ? `${row.assignedHeadingDegrees} deg` : row.geometry.pathLabel;
+      const integrityBadge =
+        row.integrity?.status === "failed"
+          ? `<div class="mt-3 rounded border border-amber-500/70 bg-amber-950/60 p-2 text-xs text-amber-200">
+               <p class="font-bold uppercase tracking-[0.2em]">Geometry unresolved</p>
+               <p class="mt-1">${row.integrity.errors.join("; ")}</p>
+             </div>`
+          : "";
 
       return `
         <article class="procedure-card">
@@ -575,6 +589,7 @@ function renderProcedurePanel(procedure) {
             <span class="text-xs uppercase tracking-[0.18em] text-slate-400">${heading}</span>
           </div>
           <p class="text-sm text-slate-200">${row.instructionText}</p>
+          ${integrityBadge}
           <dl class="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-400">
             <div>
               <dt class="uppercase tracking-[0.15em] text-slate-500">Trigger</dt>
@@ -669,7 +684,7 @@ function drawRadar(procedure) {
   const pixelsPerNM = (Math.min(elements.canvas.width, elements.canvas.height) / 2) / RADAR_RANGE_NM;
 
   canvasContext.clearRect(0, 0, width, height);
-  drawRangeRings(centerX, centerY, pixelsPerNM);
+  drawRangeRings(centerX, centerY, pixelsPerNM, procedure);
   drawRunways(centerX, centerY);
   drawTargets();
 
@@ -689,7 +704,7 @@ function resizeCanvas() {
   elements.canvas.height = Math.max(1, Math.floor(bounds.height));
 }
 
-function drawRangeRings(centerX, centerY, pixelsPerNM) {
+function drawRangeRings(centerX, centerY, pixelsPerNM, procedure) {
   canvasContext.strokeStyle = "rgba(34, 211, 238, 0.24)";
   canvasContext.lineWidth = 1;
 
@@ -699,9 +714,13 @@ function drawRangeRings(centerX, centerY, pixelsPerNM) {
     canvasContext.stroke();
   });
 
-  canvasContext.fillStyle = "rgba(226, 232, 240, 0.72)";
-  canvasContext.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
-  canvasContext.fillText("KSFO", centerX + 16, centerY - 12);
+  const airportLabel = procedure?.airport?.icao || procedure?.source?.airportCode || "";
+
+  if (airportLabel) {
+    canvasContext.fillStyle = "rgba(226, 232, 240, 0.72)";
+    canvasContext.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+    canvasContext.fillText(airportLabel, centerX + 16, centerY - 12);
+  }
 }
 
 function drawRunways(centerX, centerY) {
@@ -744,7 +763,41 @@ function drawTargets() {
   });
 }
 
+function getProjectionAnchor(procedure) {
+  for (const row of procedure.procedureRows || []) {
+    for (const segment of row.geometry?.segments || []) {
+      const computedPoints = getComputedPoints(segment);
+
+      for (const point of computedPoints) {
+        const origin = point?.path?.parametric?.origin;
+
+        if (Number.isFinite(origin?.latitude) && Number.isFinite(origin?.longitude)) {
+          return { latitude: origin.latitude, longitude: origin.longitude };
+        }
+
+        if (Number.isFinite(point?.latitude) && Number.isFinite(point?.longitude)) {
+          return { latitude: point.latitude, longitude: point.longitude };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function getComputedPoints(segment) {
+  const trigger = segment?.computedSpatialTrigger;
+
+  if (Array.isArray(trigger?.computedTurnPoints)) {
+    return trigger.computedTurnPoints;
+  }
+
+  return trigger?.computedTurnPoint ? [trigger.computedTurnPoint] : [];
+}
+
 function drawProcedureVector(procedure, centerX, centerY, pixelsPerNM) {
+  activeProjectionAnchor = getProjectionAnchor(procedure);
+
   if (procedure.procedureType === "conditional_route") {
     drawSequentialFlightPath(
       centerX,
@@ -833,67 +886,224 @@ function drawSequentialFlightPath(centerX, centerY, segments, strokeColor, label
 }
 
 function drawCogoTurnPath(currentPosition, segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY) {
-  console.log("CANVAS RENDERER EXECUTING NEW PATH LOGIC");
+  // Preferred source: the backend's distributable path artifact (parametric +
+  // GeoJSON). Draws every runway's track, supporting multi-runway fans.
+  const pathResult = drawBackendPathArtifacts(segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY);
 
+  if (pathResult) {
+    return pathResult;
+  }
+
+  // Legacy fallback: reconstruct the arc client-side from turn telemetry for
+  // procedures stored before path artifacts existed.
   const computedPoint = segment.computedSpatialTrigger?.computedTurnPoint;
-  const resultingAction = segment.computedSpatialTrigger?.resultingAction || segment.spatialTrigger?.resultingAction;
-  const outboundHeading = Number(resultingAction?.magneticHeading);
 
-  if (!computedPoint || typeof outboundHeading !== "number" || Number.isNaN(outboundHeading)) {
+  if (!computedPoint) {
     return null;
   }
 
+  const telemetry = resolveTurnTelemetry(computedPoint);
+
+  if (!telemetry) {
+    return null;
+  }
+
+  const { inboundTrueHeading, targetTrueHeading, turnDegrees, headingLabel, directionLabel } = telemetry;
   const triggerPosition = geoPointToCanvasPosition(computedPoint, centerX, centerY, pixelsPerNM);
-  const headingRadians = degreesToRadians(outboundHeading);
-  const outboundDistance = 12 * pixelsPerNM;
-  const outboundPosition = {
-    x: triggerPosition.x + Math.sin(headingRadians) * outboundDistance,
-    y: triggerPosition.y - Math.cos(headingRadians) * outboundDistance
-  };
-  const turnDirection = resultingAction.turnDirection ? resultingAction.turnDirection.toUpperCase() : "TURN";
-  const runwayX = currentPosition.x;
-  const runwayY = currentPosition.y;
-  const turnPointX = triggerPosition.x;
-  const turnPointY = triggerPosition.y;
-  const outboundEndX = outboundPosition.x;
-  const outboundEndY = outboundPosition.y;
+
+  if (!Number.isFinite(triggerPosition.x) || !Number.isFinite(triggerPosition.y)) {
+    return null;
+  }
+
+  // Turn radius and outbound leg are defined in NM so they scale with zoom.
+  const turnRadiusPx = TURN_RADIUS_NM * pixelsPerNM;
+  const arc = computeTurnArcGeometry(triggerPosition, inboundTrueHeading, turnDegrees, turnRadiusPx);
+  const outboundPosition = projectFromPosition(arc.rolloutPosition, targetTrueHeading, OUTBOUND_LEG_NM * pixelsPerNM);
 
   canvasContext.save();
   canvasContext.strokeStyle = strokeColor;
   canvasContext.lineWidth = 2;
+
+  // One continuous path: inbound track -> sweeping turn -> outbound vector.
   canvasContext.beginPath();
-  canvasContext.moveTo(runwayX, runwayY);
-  if (Number.isFinite(turnPointX) && Number.isFinite(turnPointY)) {
-    canvasContext.lineTo(turnPointX, turnPointY);
-    if (Number.isFinite(outboundEndX) && Number.isFinite(outboundEndY)) {
-      canvasContext.lineTo(outboundEndX, outboundEndY);
-    }
-  }
+  canvasContext.moveTo(currentPosition.x, currentPosition.y);
+  canvasContext.lineTo(triggerPosition.x, triggerPosition.y);
+  canvasContext.arc(
+    arc.center.x,
+    arc.center.y,
+    turnRadiusPx,
+    arc.startAngleRadians,
+    arc.endAngleRadians,
+    arc.isCounterClockwise
+  );
+  canvasContext.lineTo(outboundPosition.x, outboundPosition.y);
   canvasContext.stroke();
   canvasContext.restore();
 
-  drawArrowHead(outboundPosition.x, outboundPosition.y, headingRadians - Math.PI / 2, strokeColor);
+  const outboundHeadingRadians = degreesToRadians(targetTrueHeading);
+  drawArrowHead(outboundPosition.x, outboundPosition.y, outboundHeadingRadians - Math.PI / 2, strokeColor);
   drawTurnJoint(triggerPosition, strokeColor);
-  drawSegmentLabel(triggerPosition, `${segment.label} ${turnDirection}`, labelColor);
-  drawSegmentLabel(outboundPosition, `${outboundHeading} deg`, labelColor);
+  drawSegmentLabel(triggerPosition, `${segment.label} ${directionLabel}`, labelColor);
+  drawSegmentLabel(outboundPosition, headingLabel, labelColor);
 
   return {
     currentPosition: outboundPosition,
-    finalHeadingRadians: headingRadians
+    finalHeadingRadians: outboundHeadingRadians
+  };
+}
+
+function drawBackendPathArtifacts(segment, strokeColor, labelColor, pixelsPerNM, centerX, centerY) {
+  const pointsWithPaths = getComputedPoints(segment).filter(
+    (point) => point?.path?.geojson?.features?.length > 0
+  );
+
+  if (pointsWithPaths.length === 0) {
+    return null;
+  }
+
+  let continuation = null;
+
+  pointsWithPaths.forEach((point, index) => {
+    const { parametric, geojson } = point.path;
+    const trackFeature = geojson.features.find((feature) => feature.geometry?.type === "LineString");
+
+    if (!trackFeature) {
+      return;
+    }
+
+    const canvasTrack = trackFeature.geometry.coordinates.map(([longitude, latitude]) =>
+      geoPointToCanvasPosition({ latitude, longitude }, centerX, centerY, pixelsPerNM)
+    );
+
+    canvasContext.save();
+    canvasContext.strokeStyle = strokeColor;
+    canvasContext.lineWidth = 2;
+    canvasContext.beginPath();
+    canvasTrack.forEach((position, pointIndex) => {
+      if (pointIndex === 0) {
+        canvasContext.moveTo(position.x, position.y);
+      } else {
+        canvasContext.lineTo(position.x, position.y);
+      }
+    });
+    canvasContext.stroke();
+    canvasContext.restore();
+
+    const outboundHeading = Number(parametric.outbound?.trueHeading);
+    const endPosition = canvasTrack[canvasTrack.length - 1];
+
+    if (Number.isFinite(outboundHeading) && endPosition) {
+      drawArrowHead(endPosition.x, endPosition.y, degreesToRadians(outboundHeading) - Math.PI / 2, strokeColor);
+    }
+
+    const triggerPosition = geoPointToCanvasPosition(parametric.triggerPoint, centerX, centerY, pixelsPerNM);
+    drawTurnJoint(triggerPosition, strokeColor);
+
+    // Label only the first runway's track to keep multi-runway fans readable.
+    if (index === 0) {
+      const directionLabel = parametric.turn
+        ? String(parametric.turn.direction || "turn").toUpperCase()
+        : "THRU";
+      drawSegmentLabel(triggerPosition, `${segment.label} ${directionLabel}`, labelColor);
+
+      const headingLabel = Number.isFinite(Number(point.targetMagneticHeading))
+        ? `${Math.round(point.targetMagneticHeading)}\u00B0 M`
+        : `${Math.round(outboundHeading)}\u00B0 T`;
+
+      if (endPosition) {
+        drawSegmentLabel(endPosition, headingLabel, labelColor);
+      }
+    }
+
+    if (index === 0 && endPosition) {
+      continuation = {
+        currentPosition: endPosition,
+        finalHeadingRadians: degreesToRadians(Number.isFinite(outboundHeading) ? outboundHeading : 0)
+      };
+    }
+  });
+
+  return continuation;
+}
+
+/**
+ * Extracts the WGS-84 True North turn telemetry emitted by the backend
+ * geo engine. Returns null when the segment predates the telemetry schema,
+ * so the caller can fall back to generic segment rendering.
+ */
+function resolveTurnTelemetry(computedPoint) {
+  const inboundTrueHeading = Number(computedPoint.departureTrueHeading);
+  const targetTrueHeading = Number(computedPoint.targetHeading);
+  const turnDegrees = Number(computedPoint.turnDegrees);
+
+  if (!Number.isFinite(inboundTrueHeading) || !Number.isFinite(targetTrueHeading) || !Number.isFinite(turnDegrees)) {
+    return null;
+  }
+
+  const magneticHeading = Number(computedPoint.targetMagneticHeading);
+  const headingLabel = Number.isFinite(magneticHeading)
+    ? `${Math.round(magneticHeading)}\u00B0 M`
+    : `${Math.round(targetTrueHeading)}\u00B0 T`;
+  const directionLabel =
+    typeof computedPoint.turnDirection === "string" ? computedPoint.turnDirection.toUpperCase() : "TURN";
+
+  return { inboundTrueHeading, targetTrueHeading, turnDegrees, headingLabel, directionLabel };
+}
+
+/**
+ * Builds the canvas arc for a constant-radius turn starting at entryPosition,
+ * tangent to the inbound True heading, sweeping through turnDegrees
+ * (negative = left/counter-clockwise, positive = right/clockwise on screen).
+ *
+ * Aviation True North (0 deg = up, clockwise-positive) maps to canvas angles
+ * (0 rad = 3 o'clock, clockwise-positive because the Y-axis is inverted) via
+ * canvasAngle = heading - 90 deg. See headingToCanvasAngle().
+ */
+function computeTurnArcGeometry(entryPosition, inboundTrueHeading, turnDegrees, turnRadiusPx) {
+  const turnSign = turnDegrees >= 0 ? 1 : -1;
+
+  // The turn circle's center sits 90 deg abeam the inbound track, on the side of the turn.
+  const bearingToCenter = inboundTrueHeading + turnSign * 90;
+  const center = projectFromPosition(entryPosition, bearingToCenter, turnRadiusPx);
+
+  // Radials from the center: the arc starts at the entry point and sweeps by turnDegrees.
+  const startRadialHeading = inboundTrueHeading - turnSign * 90;
+  const endRadialHeading = startRadialHeading + turnDegrees;
+  const rolloutPosition = projectFromPosition(center, endRadialHeading, turnRadiusPx);
+
+  return {
+    center,
+    startAngleRadians: headingToCanvasAngle(startRadialHeading),
+    endAngleRadians: headingToCanvasAngle(endRadialHeading),
+    isCounterClockwise: turnSign < 0,
+    rolloutPosition
+  };
+}
+
+function headingToCanvasAngle(headingDegrees) {
+  return degreesToRadians(headingDegrees - 90);
+}
+
+function projectFromPosition(position, headingDegrees, distancePx) {
+  const headingRadians = degreesToRadians(headingDegrees);
+
+  return {
+    x: position.x + Math.sin(headingRadians) * distancePx,
+    y: position.y - Math.cos(headingRadians) * distancePx
   };
 }
 
 function geoPointToCanvasPosition(point, centerX, centerY, pixelsPerNM) {
   const latitude = Number(point.latitude);
   const longitude = Number(point.longitude);
+  const anchor = activeProjectionAnchor;
 
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !anchor) {
     return { x: centerX, y: centerY };
   }
 
-  const deltaNorthNm = (latitude - KSLC_16L_THRESHOLD.latitude) * 60;
-  const deltaEastNm =
-    (longitude - KSLC_16L_THRESHOLD.longitude) * 60 * Math.cos(degreesToRadians(KSLC_16L_THRESHOLD.latitude));
+  const deltaNorthNm = (latitude - anchor.latitude) * 60;
+  const deltaEastNm = (longitude - anchor.longitude) * 60 * Math.cos(degreesToRadians(anchor.latitude));
 
   return {
     x: centerX + deltaEastNm * pixelsPerNM,
