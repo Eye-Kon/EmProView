@@ -89,6 +89,14 @@ app.post("/api/verify", requireAuth, async (req, res) => {
         return res.status(400).json({ error: "Invalid payload: procedureRows array is required." });
     }
 
+    let verifyFlightDate;
+
+    try {
+        verifyFlightDate = parseFlightDate(incomingProcedure.flightDate);
+    } catch (error) {
+        return res.status(400).json({ error: error.message });
+    }
+
     try {
         const incomingAirportCode = getProcedureAirportCode(incomingProcedure);
 
@@ -115,7 +123,7 @@ app.post("/api/verify", requireAuth, async (req, res) => {
             }
         }
 
-        const enrichedProcedure = await enrichProcedureWithSpatialTriggers(incomingProcedure);
+        const enrichedProcedure = await enrichProcedureWithSpatialTriggers(incomingProcedure, verifyFlightDate);
 
         // Publication gate: extraction previews may carry partial results, but a
         // published procedure must have every row's geometry fully resolved.
@@ -178,10 +186,18 @@ app.delete("/api/procedures/:airportCode/:runway", requireAuth, async (req, res)
 });
 
 app.post("/api/extract", requireAuth, async (req, res) => {
-    const rawText = req.body.text;
+    const rawText = req.body.text ?? req.body.chartText;
 
     if (typeof rawText !== "string" || rawText.trim() === "") {
         return res.status(400).json({ error: "Missing required field: text" });
+    }
+
+    let flightDate;
+
+    try {
+        flightDate = parseFlightDate(req.body.flightDate);
+    } catch (error) {
+        return res.status(400).json({ error: error.message });
     }
 
     try {
@@ -201,7 +217,7 @@ app.post("/api/extract", requireAuth, async (req, res) => {
         });
 
         const extractedProcedure = JSON.parse(response.choices[0].message.content);
-        return res.json(await enrichProcedureWithSpatialTriggers(extractedProcedure));
+        return res.json(await enrichProcedureWithSpatialTriggers(extractedProcedure, flightDate));
     } catch (error) {
         console.error("OpenAI extraction failed:", error);
         return res.status(500).json({ error: "Failed to extract procedure data" });
@@ -282,7 +298,22 @@ function getAirportQuery(airportCode) {
     };
 }
 
-async function enrichProcedureWithSpatialTriggers(procedure) {
+/** Optional flightDate from an API payload: undefined passes through (query layer defaults to now). */
+function parseFlightDate(rawFlightDate) {
+    if (rawFlightDate === undefined || rawFlightDate === null) {
+        return undefined;
+    }
+
+    const date = new Date(rawFlightDate);
+
+    if (!Number.isFinite(date.getTime())) {
+        throw new Error(`Invalid flightDate: ${rawFlightDate}. Expected an ISO-8601 date string.`);
+    }
+
+    return date;
+}
+
+async function enrichProcedureWithSpatialTriggers(procedure, flightDate) {
     if (!procedure?.procedureRows) {
         return procedure;
     }
@@ -301,7 +332,7 @@ async function enrichProcedureWithSpatialTriggers(procedure) {
                     geometry: {
                         ...row.geometry,
                         segments: await Promise.all((row.geometry?.segments || []).map((segment) =>
-                            enrichSegmentWithSpatialTrigger(segment, row, { airportCode })
+                            enrichSegmentWithSpatialTrigger(segment, row, { airportCode, flightDate })
                         ))
                     },
                     integrity: { status: "enriched", errors: [] }
