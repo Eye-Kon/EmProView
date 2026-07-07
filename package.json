@@ -12,10 +12,13 @@
   "type": "commonjs",
   "dependencies": {
     "@turf/turf": "^7.3.5",
+    "adm-zip": "^0.5.18",
+    "axios": "^1.18.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "mongodb": "^7.3.0",
     "multer": "^2.2.0",
+    "node-cron": "^4.6.0",
     "openai": "^6.44.0"
   }
 }

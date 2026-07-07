@@ -8,6 +8,7 @@ const path = require("path");
 const { procedureSchema } = require("./backend/openai_schema_definition");
 const { segmentProcessor, DataIntegrityError } = require("./backend/geo_engine");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
+const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -36,6 +37,7 @@ async function connectDB() {
         db = client.db("emproview");
         console.log("Connected to MongoDB");
         await seedDatabase();
+        initNasrUpdater(db); // Weekly NASR ingestion + startup AIRAC catch-up
     } catch (error) {
         console.error("CRITICAL FATAL: Failed to connect to MongoDB", error);
         process.exit(1); // Force server to crash if DB isn't available, preventing ghost state

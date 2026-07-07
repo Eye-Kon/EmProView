@@ -135,12 +135,16 @@ function signedVariation(magnitude, hemisphere) {
     return null;
 }
 
-function main() {
-    const args = parseArgs(process.argv);
+/**
+ * Parses an extracted NASR CSV folder into the ground-truth database object.
+ * Shared by the CLI below and backend/jobs/nasrUpdater.js. Throws on
+ * unusable input (e.g. missing EFF_DATE) instead of exiting the process.
+ */
+function buildNavDatabase(dir) {
     const stats = { airports: 0, runways: 0, runwaysSkipped: 0, navaids: 0, navaidsSkipped: 0, navaidCollisions: 0 };
 
     console.log("Loading APT_BASE.csv ...");
-    const airportRows = loadCsvAsObjects(path.join(args.dir, "APT_BASE.csv"));
+    const airportRows = loadCsvAsObjects(path.join(dir, "APT_BASE.csv"));
     const airportsByKey = new Map();
 
     for (const row of airportRows) {
@@ -157,7 +161,7 @@ function main() {
     }
 
     console.log("Loading APT_RWY_END.csv ...");
-    const runwayEndRows = loadCsvAsObjects(path.join(args.dir, "APT_RWY_END.csv"));
+    const runwayEndRows = loadCsvAsObjects(path.join(dir, "APT_RWY_END.csv"));
     const runways = {};
     let effectiveDateRaw = null;
 
@@ -191,7 +195,7 @@ function main() {
     }
 
     console.log("Loading NAV_BASE.csv ...");
-    const navaidRows = loadCsvAsObjects(path.join(args.dir, "NAV_BASE.csv"));
+    const navaidRows = loadCsvAsObjects(path.join(dir, "NAV_BASE.csv"));
 
     // NAV_IDs are not globally unique: NDBs share idents with VORs, and
     // terminal stations share idents with enroute stations across the
@@ -231,8 +235,7 @@ function main() {
     }
 
     if (!effectiveDateRaw) {
-        console.error("Could not determine EFF_DATE from NASR data; aborting.");
-        process.exit(1);
+        throw new Error("Could not determine EFF_DATE from NASR data; aborting.");
     }
 
     // NASR EFF_DATE format: YYYY/MM/DD (UTC cycle start).
@@ -250,6 +253,14 @@ function main() {
         runways
     };
 
+    return { database, stats };
+}
+
+function main() {
+    const args = parseArgs(process.argv);
+    const { database, stats } = buildNavDatabase(args.dir);
+    const cycle = database.airac;
+
     fs.writeFileSync(args.out, JSON.stringify(database, null, 2));
     console.log(`AIRAC cycle ${cycle.ident} (${cycle.effectiveFrom} -> ${cycle.effectiveTo})`);
     console.log(
@@ -259,4 +270,8 @@ function main() {
     );
 }
 
-main();
+if (require.main === module) {
+    main();
+}
+
+module.exports = { buildNavDatabase };
