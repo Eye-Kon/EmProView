@@ -14,9 +14,12 @@ const { DataIntegrityError } = require("../DataIntegrityError");
 
 const TRIGGER_TYPE = "RADIAL_DISTANCE_INTERSECTION";
 
-function solve(segment, row, context) {
+async function solve(segment, row, context) {
     const navDb = requireField(context?.navDb, "context.navDb");
     const airportCode = requireNonEmptyString(context?.airportCode, "context.airportCode");
+    // Temporal targeting: ground truth resolves against the AIRAC cycle
+    // effective on the flight date (undefined = current UTC time).
+    const flightDate = context?.flightDate;
 
     const spatialTrigger = requireField(segment.spatialTrigger, "segment.spatialTrigger");
     const referenceNavaid = requireNonEmptyString(
@@ -38,11 +41,16 @@ function solve(segment, row, context) {
     // Resolve runway ground truth first: the runway threshold anchors the
     // spatial disambiguation of duplicate navaid idents (FMS behavior — the
     // station nearest the procedure's origin wins, never a blind ident match).
-    const runways = runwayIdentifiers.map((runwayIdentifier) => navDb.getRunway(airportCode, runwayIdentifier));
-    const navaid = navDb.getNavaid(referenceNavaid, {
-        latitude: runways[0].latitude,
-        longitude: runways[0].longitude
-    });
+    // An undefined flightDate falls through to the query layer's default
+    // (current UTC time).
+    const runways = await Promise.all(
+        runwayIdentifiers.map((runwayIdentifier) => navDb.getRunway(airportCode, runwayIdentifier, flightDate))
+    );
+    const navaid = await navDb.getNavaid(
+        referenceNavaid,
+        { latitude: runways[0].latitude, longitude: runways[0].longitude },
+        flightDate
+    );
     const computedTurnPoints = runways.map((runway) =>
         solveForRunway({
             runway,
@@ -68,7 +76,9 @@ function solve(segment, row, context) {
         },
         triggerDistanceNM,
         // Provenance: the AIRAC cycle whose ground truth produced this geometry.
-        groundTruth: typeof navDb.getActiveCycle === "function" ? { airacCycle: navDb.getActiveCycle() } : undefined,
+        groundTruth: typeof navDb.determineActiveCycle === "function"
+            ? { airacCycle: await navDb.determineActiveCycle(flightDate ?? new Date()) }
+            : undefined,
         computedTurnPoints,
         // Preserved single-runway contract for existing renderers.
         ...(computedTurnPoints.length === 1 ? { computedTurnPoint: computedTurnPoints[0] } : {})

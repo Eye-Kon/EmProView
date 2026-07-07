@@ -9,6 +9,7 @@ const { procedureSchema } = require("./backend/openai_schema_definition");
 const { segmentProcessor, DataIntegrityError } = require("./backend/geo_engine");
 const { systemInstructions, fewShotExamples } = require("./backend/prompt");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
+const { initNavDb } = require("./utils/navDbQuery");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -36,6 +37,7 @@ async function connectDB() {
         await client.connect();
         db = client.db("emproview");
         console.log("Connected to MongoDB");
+        initNavDb(db); // Point the geodetic ground-truth layer at live nav_data
         await seedDatabase();
         initNasrUpdater(db); // Weekly NASR ingestion + startup AIRAC catch-up
     } catch (error) {
@@ -113,7 +115,7 @@ app.post("/api/verify", requireAuth, async (req, res) => {
             }
         }
 
-        const enrichedProcedure = enrichProcedureWithSpatialTriggers(incomingProcedure);
+        const enrichedProcedure = await enrichProcedureWithSpatialTriggers(incomingProcedure);
 
         // Publication gate: extraction previews may carry partial results, but a
         // published procedure must have every row's geometry fully resolved.
@@ -199,7 +201,7 @@ app.post("/api/extract", requireAuth, async (req, res) => {
         });
 
         const extractedProcedure = JSON.parse(response.choices[0].message.content);
-        return res.json(enrichProcedureWithSpatialTriggers(extractedProcedure));
+        return res.json(await enrichProcedureWithSpatialTriggers(extractedProcedure));
     } catch (error) {
         console.error("OpenAI extraction failed:", error);
         return res.status(500).json({ error: "Failed to extract procedure data" });
@@ -280,7 +282,7 @@ function getAirportQuery(airportCode) {
     };
 }
 
-function enrichProcedureWithSpatialTriggers(procedure) {
+async function enrichProcedureWithSpatialTriggers(procedure) {
     if (!procedure?.procedureRows) {
         return procedure;
     }
@@ -292,15 +294,15 @@ function enrichProcedureWithSpatialTriggers(procedure) {
     // carries its own integrity report; failed rows keep their raw segments.
     return {
         ...procedure,
-        procedureRows: procedure.procedureRows.map((row) => {
+        procedureRows: await Promise.all(procedure.procedureRows.map(async (row) => {
             try {
                 return {
                     ...row,
                     geometry: {
                         ...row.geometry,
-                        segments: (row.geometry?.segments || []).map((segment) =>
+                        segments: await Promise.all((row.geometry?.segments || []).map((segment) =>
                             enrichSegmentWithSpatialTrigger(segment, row, { airportCode })
-                        )
+                        ))
                     },
                     integrity: { status: "enriched", errors: [] }
                 };
@@ -319,16 +321,16 @@ function enrichProcedureWithSpatialTriggers(procedure) {
                     }
                 };
             }
-        })
+        }))
     };
 }
 
-function enrichSegmentWithSpatialTrigger(segment, row, context) {
+async function enrichSegmentWithSpatialTrigger(segment, row, context) {
     if (!segment?.spatialTrigger) {
         return segment;
     }
 
-    const computedSpatialTrigger = segmentProcessor.process(segment, row, context);
+    const computedSpatialTrigger = await segmentProcessor.process(segment, row, context);
 
     if (!computedSpatialTrigger) {
         return segment;

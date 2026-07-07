@@ -14,7 +14,7 @@ class SegmentProcessor {
     /**
      * @param {object} dependencies
      * @param {object} dependencies.navDb - ground-truth query layer (navDbQuery)
-     *   exposing getRunway(airportCode, runwayId) and getNavaid(identifier).
+     *   exposing async getRunway(airportCode, runwayId) and getNavaid(identifier).
      */
     constructor({ navDb } = {}) {
         this.navDb = requireField(navDb, "SegmentProcessor dependency: navDb");
@@ -52,9 +52,12 @@ class SegmentProcessor {
 
     /**
      * Routes a segment to its registered solver.
-     * Returns null when the segment carries no spatial trigger (nothing to
-     * compute); throws DataIntegrityError for any malformed or unsupported
-     * payload so the path calculation terminates immediately.
+     *
+     * Solvers are async (ground truth is resolved from MongoDB), so this
+     * returns a Promise (or null when the segment carries no spatial trigger
+     * — nothing to compute). Rejects with DataIntegrityError for any
+     * malformed or unsupported payload so the path calculation terminates
+     * immediately.
      */
     process(segment, row, context) {
         if (!segment?.spatialTrigger) {

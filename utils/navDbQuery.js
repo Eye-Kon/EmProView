@@ -1,52 +1,116 @@
 /**
  * navDbQuery: the physical ground-truth boundary for the geodetic engine.
  *
- * The geo engine is injected with this service and never reads raw database
- * records itself. Every accessor validates the record before returning it, so
- * downstream solvers can trust that coordinates, True Headings, and Magnetic
- * Variations are present and finite. Magnetic variation is expressed in
- * degrees, East-positive (True = Magnetic + variation).
+ * Ground truth lives in the multi-cycle MongoDB `nav_data` collection,
+ * maintained by backend/jobs/nasrUpdater.js: the currently effective AIRAC
+ * cycle and the upcoming preloaded cycle coexist, every document stamped
+ * with an `airacCycle` field and each cycle carrying its own metadata doc
+ * (_id: "airac_<cycle>").
  *
- * Temporal enforcement: every query first asserts that the database's AIRAC
- * cycle covers the current UTC time. Expired ground truth throws
- * AiracExpiredError and halts extraction — the engine never computes
- * geometry from stale data.
+ * Queries are temporal: every accessor takes a flightDate (defaulting to
+ * the current UTC time) and resolves against the cycle whose effective
+ * window covers that date. No covering cycle throws AiracExpiredError —
+ * the engine never computes geometry from stale or not-yet-effective
+ * ground truth.
+ *
+ * The geo engine is injected with this service and never reads raw
+ * database records itself. Every accessor validates the record before
+ * returning it, so downstream solvers can trust that coordinates, True
+ * Headings, and Magnetic Variations are present and finite. Magnetic
+ * variation is expressed in degrees, East-positive (True = Magnetic +
+ * variation).
+ *
+ * Initialization: server.js must call initNavDb(db) with the established
+ * MongoDB Db instance before any query runs. All accessors are async.
  */
-const navDatabase = require("../data/navDatabase.json");
 const { isCycleCurrent, getCycleForDate } = require("./airac");
 const { DataIntegrityError } = require("../backend/geo/DataIntegrityError");
 const { AiracExpiredError } = require("../backend/geo/AiracExpiredError");
 const { requireFiniteNumber, requireNonEmptyString } = require("../backend/geo/validation");
 
-function getActiveCycle() {
-    const cycle = navDatabase.airac;
+const NAV_DATA_COLLECTION = "nav_data";
 
-    if (!cycle || typeof cycle.ident !== "string") {
-        throw new DataIntegrityError("navDatabase is missing its AIRAC cycle metadata.");
+let navDataCollection = null;
+
+/**
+ * Injects the active MongoDB connection. Must be called once at startup,
+ * after the client connects and before the geo engine serves any request.
+ *
+ * @param {import("mongodb").Db} db - connected Db instance
+ */
+function initNavDb(db) {
+    if (!db || typeof db.collection !== "function") {
+        throw new Error("initNavDb requires a connected MongoDB Db instance.");
     }
 
-    return {
-        ident: cycle.ident,
-        effectiveFrom: cycle.effectiveFrom,
-        effectiveTo: cycle.effectiveTo,
-        source: cycle.source
-    };
+    navDataCollection = db.collection(NAV_DATA_COLLECTION);
 }
 
-function assertCycleCurrent(now = new Date()) {
-    const cycle = getActiveCycle();
-
-    if (!isCycleCurrent(cycle, now)) {
-        const requiredCycle = getCycleForDate(now);
-
-        throw new AiracExpiredError(
-            `Ground-truth database AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom} to ${cycle.effectiveTo}) ` +
-            `does not cover the current UTC time. Current cycle is ${requiredCycle.ident}. ` +
-            "Refresh the database via the NASR ETL before computing geometry."
+function getCollection() {
+    if (!navDataCollection) {
+        throw new Error(
+            "navDbQuery is not initialized. Call initNavDb(db) with the active MongoDB connection before querying."
         );
     }
 
-    return cycle;
+    return navDataCollection;
+}
+
+function normalizeFlightDate(flightDate) {
+    const date = flightDate instanceof Date ? flightDate : new Date(flightDate);
+
+    if (!Number.isFinite(date.getTime())) {
+        throw new DataIntegrityError(`flightDate must be a valid date, got: ${flightDate}`);
+    }
+
+    return date;
+}
+
+/**
+ * Resolves the AIRAC cycle whose effective window covers the flight date.
+ * Throws AiracExpiredError when no loaded cycle covers it (stale database,
+ * or a flight date outside the loaded current/upcoming windows).
+ *
+ * @param {Date|string|number} [flightDate] - defaults to current UTC time
+ */
+async function determineActiveCycle(flightDate = new Date()) {
+    const date = normalizeFlightDate(flightDate);
+    const metas = await getCollection().find({ docType: "meta" }).toArray();
+
+    if (metas.length === 0) {
+        throw new DataIntegrityError(
+            "nav_data holds no AIRAC cycle metadata. Has the NASR ingestion job run yet?"
+        );
+    }
+
+    const covering = metas.find((meta) => isCycleCurrent(meta, date));
+
+    if (!covering) {
+        let requiredIdent = "unknown";
+
+        try {
+            requiredIdent = getCycleForDate(date).ident;
+        } catch {
+            // Pre-epoch or otherwise unresolvable date; report it as unknown.
+        }
+
+        const loadedCycles = metas
+            .map((meta) => `${meta.airacCycle} (${meta.effectiveFrom} to ${meta.effectiveTo})`)
+            .sort()
+            .join(", ");
+
+        throw new AiracExpiredError(
+            `No ground-truth AIRAC cycle covers flight date ${date.toISOString()} (required cycle ${requiredIdent}). ` +
+            `Loaded cycles: ${loadedCycles}. Refresh the database via the NASR ETL before computing geometry.`
+        );
+    }
+
+    return {
+        ident: covering.airacCycle,
+        effectiveFrom: covering.effectiveFrom,
+        effectiveTo: covering.effectiveTo,
+        source: covering.source
+    };
 }
 
 const EARTH_RADIUS_NM = 3440.065;
@@ -63,7 +127,8 @@ function greatCircleDistanceNM(a, b) {
 }
 
 /**
- * Resolves a navaid identifier to a single validated station.
+ * Resolves a navaid identifier to a single validated station, using the
+ * ground truth of the AIRAC cycle effective on the flight date.
  *
  * Navaid identifiers are NOT globally unique in the NAS (NDBs share idents
  * with VORs; terminal stations share idents with enroute stations across the
@@ -75,16 +140,21 @@ function greatCircleDistanceNM(a, b) {
  *
  * @param {string} identifier - navaid ident, e.g. "TCH"
  * @param {{latitude:number,longitude:number}} [referencePoint] - procedure origin
+ * @param {Date|string|number} [flightDate] - defaults to current UTC time
  */
-function getNavaid(identifier, referencePoint) {
-    assertCycleCurrent();
+async function getNavaid(identifier, referencePoint, flightDate = new Date()) {
+    const activeCycle = await determineActiveCycle(flightDate);
 
     const navaidId = requireNonEmptyString(identifier, "navaid identifier");
-    const rawCandidates = navDatabase.navaids?.[navaidId];
-    const candidates = Array.isArray(rawCandidates) ? rawCandidates : rawCandidates ? [rawCandidates] : [];
+    const document = await getCollection().findOne({
+        docType: "navaid",
+        identifier: navaidId,
+        airacCycle: activeCycle.ident
+    });
+    const candidates = Array.isArray(document?.candidates) ? document.candidates : [];
 
     if (candidates.length === 0) {
-        throw new DataIntegrityError(`Navaid not found: ${navaidId}`);
+        throw new DataIntegrityError(`Navaid not found in AIRAC cycle ${activeCycle.ident}: ${navaidId}`);
     }
 
     let selected = candidates[0];
@@ -117,7 +187,7 @@ function getNavaid(identifier, referencePoint) {
         };
     }
 
-    const fieldPath = `navDatabase.navaids.${navaidId}`;
+    const fieldPath = `nav_data[${activeCycle.ident}].navaids.${navaidId}`;
 
     return {
         identifier: navaidId,
@@ -127,23 +197,36 @@ function getNavaid(identifier, referencePoint) {
         latitude: requireFiniteNumber(selected.latitude, `${fieldPath}.latitude`),
         longitude: requireFiniteNumber(selected.longitude, `${fieldPath}.longitude`),
         magneticVariation: requireFiniteNumber(selected.magneticVariation, `${fieldPath}.magneticVariation`),
+        airacCycle: activeCycle.ident,
         ...(disambiguation ? { disambiguation } : {})
     };
 }
 
-function getRunway(airportCode, runwayIdentifier) {
-    assertCycleCurrent();
+/**
+ * Resolves a runway end using the ground truth of the AIRAC cycle effective
+ * on the flight date.
+ *
+ * @param {string} airportCode - ICAO id, e.g. "KSLC"
+ * @param {string} runwayIdentifier - runway end, e.g. "16L"
+ * @param {Date|string|number} [flightDate] - defaults to current UTC time
+ */
+async function getRunway(airportCode, runwayIdentifier, flightDate = new Date()) {
+    const activeCycle = await determineActiveCycle(flightDate);
 
     const airport = requireNonEmptyString(airportCode, "airportCode");
     const runwayId = requireNonEmptyString(runwayIdentifier, "runway identifier");
     const databaseKey = `${airport}_${runwayId}`;
-    const runway = navDatabase.runways?.[databaseKey];
+    const runway = await getCollection().findOne({
+        docType: "runway",
+        key: databaseKey,
+        airacCycle: activeCycle.ident
+    });
 
     if (!runway) {
-        throw new DataIntegrityError(`Runway not found: ${databaseKey}`);
+        throw new DataIntegrityError(`Runway not found in AIRAC cycle ${activeCycle.ident}: ${databaseKey}`);
     }
 
-    const fieldPath = `navDatabase.runways.${databaseKey}`;
+    const fieldPath = `nav_data[${activeCycle.ident}].runways.${databaseKey}`;
 
     return {
         airportCode: airport,
@@ -151,13 +234,14 @@ function getRunway(airportCode, runwayIdentifier) {
         latitude: requireFiniteNumber(runway.latitude, `${fieldPath}.latitude`),
         longitude: requireFiniteNumber(runway.longitude, `${fieldPath}.longitude`),
         trueHeading: requireFiniteNumber(runway.trueHeading, `${fieldPath}.trueHeading`),
-        magneticVariation: requireFiniteNumber(runway.magneticVariation, `${fieldPath}.magneticVariation`)
+        magneticVariation: requireFiniteNumber(runway.magneticVariation, `${fieldPath}.magneticVariation`),
+        airacCycle: activeCycle.ident
     };
 }
 
 module.exports = {
+    initNavDb,
     getNavaid,
     getRunway,
-    getActiveCycle,
-    assertCycleCurrent
+    determineActiveCycle
 };

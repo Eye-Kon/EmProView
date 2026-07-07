@@ -1,18 +1,28 @@
 /**
- * NASR Updater: automated 28-day FAA NASR ingestion with zero-downtime swaps.
+ * NASR Updater: automated 28-day FAA NASR ingestion for the multi-cycle
+ * `nav_data` collection.
  *
- * Every Tuesday at 08:00 UTC this job:
- *   1. Resolves the AIRAC cycle to ingest via utils/airac.js. When the next
- *      cycle becomes effective before the following weekly run, the upcoming
- *      cycle is preferred (falling back to the current one if the FAA has not
- *      published it yet) so the ground truth never expires between runs.
- *   2. Downloads the FAA 28-day NASR CSV subscription zip to the OS temp
- *      directory, retrying with exponential backoff (max 3 attempts).
- *   3. Extracts the CSVs and reuses scripts/etl_nasr.js to parse them.
- *   4. Writes the parsed records into the `nav_data_staging` collection.
- *   5. After verification, atomically renames `nav_data_staging` over the
- *      live `nav_data` collection (dropTarget: true) so active queries never
- *      observe a partial dataset.
+ * The collection holds every AIRAC cycle's documents side by side, each
+ * stamped with an `airacCycle` field (metadata docs are keyed
+ * "airac_<cycle>"). Spatial queries resolve against the cycle covering a
+ * specific flight date, so ingestion never touches documents of other
+ * cycles — new cycles are appended, expired ones are garbage-collected.
+ *
+ * Every Tuesday at 08:00 UTC (and once at startup) this job:
+ *   1. Targets the currently effective AIRAC cycle and the upcoming one
+ *      (via utils/airac.js), skipping any cycle already ingested.
+ *   2. Downloads each missing cycle's FAA 28-day NASR CSV subscription zip
+ *      to the OS temp directory, retrying with exponential backoff (max 3
+ *      attempts). An unpublished upcoming cycle (404) is not a failure —
+ *      it is retried on the next run.
+ *   3. Extracts the CSVs, parses them via scripts/etl_nasr.js, and inserts
+ *      the documents directly into `nav_data`. The cycle's metadata doc is
+ *      inserted LAST, only after the data documents are verified — queries
+ *      resolve cycles through their metadata, so a half-inserted cycle is
+ *      invisible and live queries keep zero-downtime semantics.
+ *   4. Garbage-collects: any cycle whose effectiveTo is more than 48 hours
+ *      in the past is wiped with deleteMany, along with legacy documents
+ *      from the old single-cycle schema (no airacCycle stamp).
  */
 const fs = require("fs");
 const os = require("os");
@@ -20,16 +30,18 @@ const path = require("path");
 const axios = require("axios");
 const cron = require("node-cron");
 const AdmZip = require("adm-zip");
-const { getCycleForDate, isCycleCurrent, CYCLE_LENGTH_MS } = require("../../utils/airac");
-const { buildNavDatabase } = require("../../scripts/etl_nasr");
+const { getCycleForDate, CYCLE_LENGTH_MS } = require("../../utils/airac");
+const { buildNavDatabase, buildNavDataDocuments } = require("../../scripts/etl_nasr");
 
 const LIVE_COLLECTION = "nav_data";
-const STAGING_COLLECTION = "nav_data_staging";
 const CRON_SCHEDULE = "0 8 * * 2"; // Every Tuesday 08:00 UTC
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 5000;
 const DOWNLOAD_TIMEOUT_MS = 120000;
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const INSERT_BATCH_SIZE = 5000;
+// Grace period after effectiveTo before a cycle is purged: keeps just-expired
+// ground truth available for in-flight work and clock-skew safety.
+const GC_GRACE_MS = 48 * 60 * 60 * 1000;
 
 // The FAA CDN rejects requests without a browser-like User-Agent.
 const HTTP_HEADERS = { "User-Agent": "Mozilla/5.0 (compatible; EmProView-NASR-Updater/1.0)" };
@@ -62,20 +74,12 @@ function buildDownloadUrl(cycle) {
     return `https://nfdc.faa.gov/webContent/28DaySub/extra/${day}_${month}_${year}_CSV.zip`;
 }
 
-/**
- * Cycles to attempt, in preference order.
- *
- * If the next cycle rolls over before the next weekly run, prefer it (the
- * FAA publishes preview data in advance) so the database does not expire
- * mid-week; otherwise ingest the currently effective cycle. The other cycle
- * is kept as a fallback in case the preferred download is not available.
- */
-function selectCandidateCycles(now = new Date()) {
-    const currentCycle = getCycleForDate(now);
-    const nextCycle = getCycleForDate(new Date(Date.parse(currentCycle.effectiveFrom) + CYCLE_LENGTH_MS));
-    const rollsOverBeforeNextRun = Date.parse(currentCycle.effectiveTo) - now.getTime() < WEEK_MS;
+/** The two cycles the database must hold: currently effective + upcoming. */
+function targetCycles(now = new Date()) {
+    const current = getCycleForDate(now);
+    const upcoming = getCycleForDate(new Date(Date.parse(current.effectiveFrom) + CYCLE_LENGTH_MS));
 
-    return rollsOverBeforeNextRun ? [nextCycle, currentCycle] : [currentCycle, nextCycle];
+    return { current, upcoming };
 }
 
 function delay(ms) {
@@ -135,91 +139,104 @@ function extractZip(zipPath, extractDir) {
     new AdmZip(zipPath).extractAllTo(extractDir, true);
 }
 
+async function isCycleIngested(db, cycle) {
+    const meta = await db.collection(LIVE_COLLECTION).findOne({ _id: `airac_${cycle.ident}` });
+
+    return Boolean(meta);
+}
+
 /**
- * Populates nav_data_staging from the parsed database. Documents:
- *   { _id: "airac", docType: "meta", ... }              cycle metadata
- *   { docType: "navaid", identifier, candidates: [] }   one per ident
- *   { docType: "runway", key, ...record }               one per runway end
+ * Downloads, parses, and inserts one AIRAC cycle into nav_data.
+ *
+ * Insertion order is the safety mechanism: data documents first, the
+ * metadata doc last as the commit point. determineActiveCycle only resolves
+ * cycles through metadata docs, so a crash mid-insert leaves an invisible
+ * partial cycle (cleared by the residue wipe on the next attempt), never a
+ * queryable half-dataset.
  */
-async function populateStaging(db, database) {
-    const staging = db.collection(STAGING_COLLECTION);
+async function ingestCycle(db, cycle, workDir) {
+    const url = buildDownloadUrl(cycle);
+    const zipPath = path.join(workDir, `nasr_${cycle.ident}.zip`);
 
-    // Clear any residue from a previously failed run.
-    await staging.drop().catch(() => {});
+    log("info", `Ingesting AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom}).`);
+    await downloadWithRetry(url, zipPath);
 
-    await staging.insertOne({ _id: "airac", docType: "meta", ...database.airac });
+    const extractDir = path.join(workDir, `csv_${cycle.ident}`);
+    extractZip(zipPath, extractDir);
 
-    const navaidDocs = Object.entries(database.navaids).map(([identifier, candidates]) => ({
-        docType: "navaid",
-        identifier,
-        candidates
-    }));
-    const runwayDocs = Object.entries(database.runways).map(([key, record]) => ({
-        docType: "runway",
-        key,
-        ...record
-    }));
+    log("info", "Running NASR ETL against extracted CSVs ...");
+    const { database } = buildNavDatabase(extractDir);
+    const { airacCycle, metaDoc, navaidDocs, runwayDocs } = buildNavDataDocuments(database);
+
+    if (airacCycle !== cycle.ident) {
+        // The data's own EFF_DATE is authoritative over the URL we targeted.
+        log("warn", `Requested cycle ${cycle.ident} but NASR data declares ${airacCycle}; ingesting as ${airacCycle}.`);
+    }
+
+    const live = db.collection(LIVE_COLLECTION);
+
+    // Clear residue from a previously interrupted ingestion of this cycle.
+    await live.deleteMany({ airacCycle });
 
     for (const docs of [navaidDocs, runwayDocs]) {
-        for (let i = 0; i < docs.length; i += 5000) {
-            await staging.insertMany(docs.slice(i, i + 5000), { ordered: false });
+        for (let i = 0; i < docs.length; i += INSERT_BATCH_SIZE) {
+            await live.insertMany(docs.slice(i, i + INSERT_BATCH_SIZE), { ordered: false });
         }
     }
 
-    await staging.createIndex({ docType: 1, identifier: 1 });
-    await staging.createIndex({ docType: 1, key: 1 });
+    // Verify the data documents landed completely before committing the cycle.
+    const navaidCount = await live.countDocuments({ airacCycle, docType: "navaid" });
+    const runwayCount = await live.countDocuments({ airacCycle, docType: "runway" });
 
-    return { navaidDocs: navaidDocs.length, runwayDocs: runwayDocs.length };
-}
-
-/** Fail-safe gate: the staging collection must be complete before the swap. */
-async function verifyStaging(db, database, inserted) {
-    const staging = db.collection(STAGING_COLLECTION);
-    const meta = await staging.findOne({ _id: "airac" });
-    const navaidCount = await staging.countDocuments({ docType: "navaid" });
-    const runwayCount = await staging.countDocuments({ docType: "runway" });
-
-    if (!meta?.ident) {
-        throw new Error("Staging verification failed: AIRAC metadata document is missing.");
-    }
-
-    if (navaidCount === 0 || runwayCount === 0) {
-        throw new Error(`Staging verification failed: empty dataset (navaids=${navaidCount}, runways=${runwayCount}).`);
-    }
-
-    if (navaidCount !== inserted.navaidDocs || runwayCount !== inserted.runwayDocs) {
+    if (navaidCount !== navaidDocs.length || runwayCount !== runwayDocs.length || navaidCount === 0 || runwayCount === 0) {
+        await live.deleteMany({ airacCycle });
         throw new Error(
-            `Staging verification failed: count mismatch (navaids ${navaidCount}/${inserted.navaidDocs}, ` +
-            `runways ${runwayCount}/${inserted.runwayDocs}).`
+            `Cycle ${airacCycle} verification failed: navaids ${navaidCount}/${navaidDocs.length}, ` +
+            `runways ${runwayCount}/${runwayDocs.length}. Partial insert rolled back.`
         );
     }
 
-    const cycleStartsWithinAWeek = Date.parse(meta.effectiveFrom) - Date.now() < WEEK_MS;
+    await live.insertOne(metaDoc);
+    await live.createIndex({ docType: 1, airacCycle: 1, identifier: 1 });
+    await live.createIndex({ docType: 1, airacCycle: 1, key: 1 });
 
-    if (!isCycleCurrent(meta) && !cycleStartsWithinAWeek) {
-        throw new Error(`Staging verification failed: AIRAC cycle ${meta.ident} is neither current nor imminent.`);
+    log("info", `Cycle ${airacCycle} committed: ${navaidCount} navaid idents, ${runwayCount} runway ends ` +
+        `(effective ${metaDoc.effectiveFrom} -> ${metaDoc.effectiveTo}).`);
+}
+
+/**
+ * Purges cycles whose effectiveTo is more than GC_GRACE_MS in the past,
+ * plus any legacy documents from the pre-multi-cycle schema.
+ */
+async function garbageCollectExpiredCycles(db, now = Date.now()) {
+    const live = db.collection(LIVE_COLLECTION);
+
+    const legacy = await live.deleteMany({ airacCycle: { $exists: false } });
+
+    if (legacy.deletedCount > 0) {
+        log("info", `GC: removed ${legacy.deletedCount} legacy single-cycle document(s).`);
     }
 
-    log("info", `Staging verified: AIRAC ${meta.ident}, ${navaidCount} navaid idents, ${runwayCount} runway ends.`);
-}
+    const metas = await live.find({ docType: "meta" }).toArray();
 
-/** Atomically promotes staging to live; active queries never see partial data. */
-async function atomicSwap(db) {
-    await db.renameCollection(STAGING_COLLECTION, LIVE_COLLECTION, { dropTarget: true });
-    log("info", `Atomic swap complete: ${STAGING_COLLECTION} -> ${LIVE_COLLECTION}.`);
-}
+    for (const meta of metas) {
+        const expiredForMs = now - Date.parse(meta.effectiveTo);
 
-async function getLiveCycle(db) {
-    try {
-        return await db.collection(LIVE_COLLECTION).findOne({ _id: "airac" });
-    } catch {
-        return null;
+        if (Number.isFinite(expiredForMs) && expiredForMs > GC_GRACE_MS) {
+            const removed = await live.deleteMany({ airacCycle: meta.airacCycle });
+            log("info", `GC: purged expired AIRAC cycle ${meta.airacCycle} ` +
+                `(ended ${meta.effectiveTo}, ${removed.deletedCount} documents).`);
+        }
     }
 }
 
 let isRunning = false;
 
-async function runNasrUpdate(db, { force = false } = {}) {
+/**
+ * Idempotent update pass: ingests whichever target cycles are missing, then
+ * garbage-collects expired ones. Safe to run at any time.
+ */
+async function runNasrUpdate(db) {
     if (isRunning) {
         log("warn", "Update already in progress; skipping this trigger.");
         return;
@@ -228,53 +245,42 @@ async function runNasrUpdate(db, { force = false } = {}) {
     isRunning = true;
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "nasr-"));
+    let hardFailure = false;
 
     try {
-        const candidates = selectCandidateCycles();
-        const liveCycle = await getLiveCycle(db);
+        const { current, upcoming } = targetCycles();
 
-        if (!force && liveCycle?.ident === candidates[0].ident) {
-            log("info", `Live nav_data already carries target AIRAC cycle ${liveCycle.ident}; nothing to do.`);
-            return;
-        }
-
-        let database = null;
-
-        for (const cycle of candidates) {
-            const url = buildDownloadUrl(cycle);
-            const zipPath = path.join(workDir, `nasr_${cycle.ident}.zip`);
-
-            try {
-                log("info", `Targeting AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom}).`);
-                await downloadWithRetry(url, zipPath);
-            } catch (error) {
-                if (error.notPublished && cycle !== candidates[candidates.length - 1]) {
-                    log("warn", `${error.message} Falling back to alternate cycle.`);
-                    continue;
-                }
-                throw error;
+        for (const [label, cycle] of [["current", current], ["upcoming", upcoming]]) {
+            if (await isCycleIngested(db, cycle)) {
+                log("info", `AIRAC cycle ${cycle.ident} (${label}) already ingested; skipping.`);
+                continue;
             }
 
-            const extractDir = path.join(workDir, `csv_${cycle.ident}`);
-            extractZip(zipPath, extractDir);
-
-            log("info", "Running NASR ETL against extracted CSVs ...");
-            database = buildNavDatabase(extractDir).database;
-            break;
+            try {
+                await ingestCycle(db, cycle, workDir);
+            } catch (error) {
+                if (error.notPublished && label === "upcoming") {
+                    log("info", `Upcoming cycle ${cycle.ident} not published by the FAA yet; will retry on the next run.`);
+                } else {
+                    hardFailure = true;
+                    log("error", `HARD FAILURE: ingestion of ${label} cycle ${cycle.ident} aborted. ` +
+                        `Existing cycles in nav_data are untouched. Cause: ${error.message}`);
+                }
+            }
         }
 
-        if (!database) {
-            throw new Error("No NASR dataset could be downloaded for any candidate cycle.");
+        await garbageCollectExpiredCycles(db);
+
+        const metas = await db.collection(LIVE_COLLECTION).find({ docType: "meta" }).toArray();
+        const loaded = metas.map((meta) => meta.airacCycle).sort().join(", ") || "none";
+
+        if (!hardFailure) {
+            log("info", `SUCCESS: update pass complete. Cycles in nav_data: ${loaded}.`);
+        } else {
+            log("warn", `Update pass finished with failures. Cycles in nav_data: ${loaded}.`);
         }
-
-        const inserted = await populateStaging(db, database);
-        await verifyStaging(db, database, inserted);
-        await atomicSwap(db);
-
-        log("info", `SUCCESS: nav_data now serves AIRAC cycle ${database.airac.ident} ` +
-            `(effective ${database.airac.effectiveFrom} -> ${database.airac.effectiveTo}).`);
     } catch (error) {
-        log("error", `HARD FAILURE: NASR update aborted. Live nav_data was NOT modified. Cause: ${error.message}`);
+        log("error", `HARD FAILURE: NASR update pass aborted. Cause: ${error.message}`);
     } finally {
         isRunning = false;
         fs.rmSync(workDir, { recursive: true, force: true });
@@ -282,8 +288,8 @@ async function runNasrUpdate(db, { force = false } = {}) {
 }
 
 /**
- * Schedules the weekly job and, if the live collection is missing or its
- * AIRAC cycle has already expired, kicks off an immediate catch-up run so a
+ * Schedules the weekly job and runs one catch-up pass immediately: the pass
+ * is idempotent (missing cycles are ingested, present ones skipped), so a
  * freshly deployed or long-stopped server heals itself without waiting for
  * Tuesday.
  */
@@ -294,19 +300,8 @@ function initNasrUpdater(db) {
     }, { timezone: "Etc/UTC" });
 
     log("info", `Scheduled NASR ingestion for every Tuesday 08:00 UTC (cron "${CRON_SCHEDULE}").`);
-
-    getLiveCycle(db).then((liveCycle) => {
-        if (!liveCycle || !isCycleCurrent(liveCycle)) {
-            log("warn", liveCycle
-                ? `Live AIRAC cycle ${liveCycle.ident} is expired; starting catch-up ingestion now.`
-                : "Live nav_data collection is empty; starting initial ingestion now.");
-            runNasrUpdate(db);
-        } else {
-            log("info", `Live nav_data is current (AIRAC ${liveCycle.ident}); next refresh on schedule.`);
-        }
-    }).catch((error) => {
-        log("error", `Startup cycle check failed: ${error.message}`);
-    });
+    log("info", "Running startup catch-up pass.");
+    runNasrUpdate(db);
 }
 
-module.exports = { initNasrUpdater, runNasrUpdate, buildDownloadUrl, selectCandidateCycles };
+module.exports = { initNasrUpdater, runNasrUpdate, buildDownloadUrl, targetCycles, garbageCollectExpiredCycles };

@@ -3,8 +3,10 @@
  *
  * Ingests the FAA's 28-day NASR CSV subscription (https://nfdc.faa.gov,
  * "28 Day NASR Subscription", CSV format) and produces the ground-truth
- * database consumed by utils/navDbQuery.js, stamped with the AIRAC cycle
- * derived from the data's own EFF_DATE.
+ * database object, stamped with the AIRAC cycle derived from the data's own
+ * EFF_DATE. In production this feeds the MongoDB nav_data collection via
+ * backend/jobs/nasrUpdater.js (utils/navDbQuery.js queries that collection);
+ * the CLI below can still emit a JSON snapshot for offline inspection.
  *
  * Usage:
  *   node scripts/etl_nasr.js --dir <extracted-csv-folder> [--out data/navDatabase.json]
@@ -256,6 +258,38 @@ function buildNavDatabase(dir) {
     return { database, stats };
 }
 
+/**
+ * Converts a parsed database object into the MongoDB document set for the
+ * multi-cycle `nav_data` collection. Every document carries an `airacCycle`
+ * stamp so spatial queries can resolve against the ground truth effective
+ * for a specific flight date, and the metadata doc is keyed per cycle
+ * (_id: "airac_<cycle>") so multiple cycles coexist.
+ */
+function buildNavDataDocuments(database) {
+    const airacCycle = database.airac.ident;
+
+    const metaDoc = {
+        _id: `airac_${airacCycle}`,
+        docType: "meta",
+        airacCycle,
+        ...database.airac
+    };
+    const navaidDocs = Object.entries(database.navaids).map(([identifier, candidates]) => ({
+        docType: "navaid",
+        airacCycle,
+        identifier,
+        candidates
+    }));
+    const runwayDocs = Object.entries(database.runways).map(([key, record]) => ({
+        docType: "runway",
+        airacCycle,
+        key,
+        ...record
+    }));
+
+    return { airacCycle, metaDoc, navaidDocs, runwayDocs };
+}
+
 function main() {
     const args = parseArgs(process.argv);
     const { database, stats } = buildNavDatabase(args.dir);
@@ -274,4 +308,4 @@ if (require.main === module) {
     main();
 }
 
-module.exports = { buildNavDatabase };
+module.exports = { buildNavDatabase, buildNavDataDocuments };
