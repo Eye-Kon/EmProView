@@ -3,17 +3,23 @@ require("dotenv").config();
 const express = require("express");
 const { MongoClient } = require("mongodb");
 const multer = require("multer");
-const OpenAI = require("openai");
 const path = require("path");
-const { procedureSchema } = require("./backend/openai_schema_definition");
-const { segmentProcessor, DataIntegrityError } = require("./backend/geo_engine");
-const { systemInstructions, fewShotExamples } = require("./backend/prompt");
+const { AiracExpiredError } = require("./backend/geo_engine");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
-const { initNavDb } = require("./utils/navDbQuery");
+const { createBatchJob, initBatchWorker, JOBS_COLLECTION, RESULTS_COLLECTION } = require("./backend/jobs/batchProcessor");
+const {
+    openai,
+    LLM_MODEL_NAME,
+    extractProcedureFromText,
+    parseFlightDate,
+    getProcedureAirportCode,
+    enrichProcedureWithSpatialTriggers
+} = require("./backend/extractionService");
+const { initNavDb, determineActiveCycle } = require("./utils/navDbQuery");
+const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExporter");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const openai = new OpenAI();
 
 // VULNERABILITY #3 PATCH: The Memory Bomb
 // Enforce strict 5MB limit and reject non-image MIME types
@@ -29,6 +35,17 @@ const upload = multer({
     }
 });
 
+// Batch ingestion accepts a JSON file upload: a 5,000-chart array is several
+// MB, far past express.json()'s 100 KB default body limit.
+const batchUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max batch file
+    fileFilter: (req, file, cb) => {
+        const isJson = (file.mimetype || "").includes("json") || path.extname(file.originalname || "").toLowerCase() === ".json";
+        cb(isJson ? null : new Error("Invalid file type. Batch upload must be a .json file."), isJson);
+    }
+});
+
 const client = new MongoClient(process.env.MONGODB_URI);
 let db;
 
@@ -40,6 +57,7 @@ async function connectDB() {
         initNavDb(db); // Point the geodetic ground-truth layer at live nav_data
         await seedDatabase();
         initNasrUpdater(db); // Weekly NASR ingestion + startup AIRAC catch-up
+        initBatchWorker(db); // Persistent async batch queue (resumes orphaned jobs)
     } catch (error) {
         console.error("CRITICAL FATAL: Failed to connect to MongoDB", error);
         process.exit(1); // Force server to crash if DB isn't available, preventing ghost state
@@ -201,26 +219,174 @@ app.post("/api/extract", requireAuth, async (req, res) => {
     }
 
     try {
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o", // Upgraded from specific 08-06 tag for broader vision/text consistency
-            temperature: 0,
-            top_p: 0.1,
-            messages: [
-                { role: "system", content: systemInstructions },
-                ...fewShotExamples,
-                { role: "user", content: rawText }
-            ],
-            response_format: {
-                type: "json_schema",
-                json_schema: procedureSchema
-            }
-        });
+        const extractedProcedure = await extractProcedureFromText(rawText);
+        const enrichedProcedure = await enrichProcedureWithSpatialTriggers(extractedProcedure, flightDate);
 
-        const extractedProcedure = JSON.parse(response.choices[0].message.content);
-        return res.json(await enrichProcedureWithSpatialTriggers(extractedProcedure, flightDate));
+        // SWIM presentation layer: ?format=aixm serializes the verified route
+        // to AIXM 5.1 XML instead of the standard JSON preview.
+        if (req.query.format === "aixm") {
+            const resolvedFlightDate = flightDate ?? new Date();
+            const airacCycle = await determineActiveCycle(resolvedFlightDate);
+            const aixmXml = generateAixmRoute(enrichedProcedure, airacCycle, resolvedFlightDate);
+
+            return res.type("application/xml").send(aixmXml);
+        }
+
+        return res.json(enrichedProcedure);
     } catch (error) {
+        // AIXM failsafe: unverified routes and uncovered flight dates are
+        // client errors (the route cannot be serialized), not server faults.
+        if (error instanceof UnserializableRouteError || error instanceof AiracExpiredError) {
+            return res.status(422).json({ error: error.message });
+        }
+
         console.error("OpenAI extraction failed:", error);
         return res.status(500).json({ error: "Failed to extract procedure data" });
+    }
+});
+
+/**
+ * Batch ingestion: accepts a JSON file upload (field "file") containing
+ * either an array of chart texts or { flightDate, items: [...] }, where each
+ * item is a string or { text } / { chartText }. Small payloads may instead
+ * be sent inline as the JSON body (subject to the 100 KB body limit).
+ * Responds immediately with 202 + jobId; the background worker does the rest.
+ */
+app.post("/api/extract/batch", requireAuth, (req, res, next) => {
+    batchUpload.single("file")(req, res, (err) => {
+        if (err instanceof multer.MulterError) {
+            return res.status(400).json({ error: `Upload error: ${err.message}` });
+        } else if (err) {
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+    try {
+        let payload;
+
+        if (req.file) {
+            try {
+                payload = JSON.parse(req.file.buffer.toString("utf8"));
+            } catch {
+                return res.status(400).json({ error: "Uploaded batch file is not valid JSON." });
+            }
+        } else {
+            payload = req.body;
+        }
+
+        const rawItems = Array.isArray(payload) ? payload : payload?.items;
+
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
+            return res.status(400).json({
+                error: "Batch payload must be a JSON array of chart texts, or { items: [...] }."
+            });
+        }
+
+        const chartTexts = rawItems.map((item) => (typeof item === "string" ? item : item?.text ?? item?.chartText));
+
+        if (chartTexts.some((text) => typeof text !== "string" || text.trim() === "")) {
+            return res.status(400).json({ error: "Every batch item must carry non-empty chart text." });
+        }
+
+        const flightDate = parseFlightDate(
+            (Array.isArray(payload) ? undefined : payload?.flightDate) ?? req.body?.flightDate ?? req.query.flightDate
+        );
+
+        const receipt = await createBatchJob(db, chartTexts, flightDate);
+
+        return res.status(202).json(receipt);
+    } catch (error) {
+        if (error instanceof AiracExpiredError) {
+            return res.status(422).json({ error: error.message });
+        }
+
+        if (error.statusCode === 400 || error.message?.startsWith("Invalid flightDate")) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        console.error("Batch job creation failed:", error);
+        return res.status(500).json({ error: "Failed to create batch job." });
+    }
+});
+
+/**
+ * Batch retrieval: job status + counters while running; paginated results
+ * (?offset, ?limit <= 1000) once finished. ?format=aixm serializes each
+ * verified result through the AIXM 5.1 exporter using the job's locked
+ * AIRAC cycle; items with failed rows are reported as unserializable.
+ */
+app.get("/api/extract/batch/:jobId", requireAuth, async (req, res) => {
+    try {
+        const job = await db.collection(JOBS_COLLECTION).findOne({ _id: req.params.jobId });
+
+        if (!job) {
+            return res.status(404).json({ error: "Batch job not found (unknown jobId, or expired after 7 days)." });
+        }
+
+        const body = {
+            jobId: job._id,
+            status: job.status,
+            totalCount: job.totalCount,
+            completedCount: job.completedCount,
+            failedCount: job.failedCount,
+            progress: `${job.completedCount + job.failedCount} / ${job.totalCount}`,
+            airacCycle: job.airacCycle,
+            flightDate: job.flightDate,
+            createdAt: job.createdAt,
+            finishedAt: job.finishedAt
+        };
+
+        if (job.status !== "completed" && job.status !== "failed") {
+            return res.json(body);
+        }
+
+        const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+        const limit = Math.min(1000, Math.max(1, Number.parseInt(req.query.limit, 10) || 100));
+        const items = await db.collection(RESULTS_COLLECTION)
+            .find({ jobId: job._id })
+            .sort({ index: 1 })
+            .skip(offset)
+            .limit(limit)
+            .toArray();
+
+        body.resultsOffset = offset;
+        body.resultsReturned = items.length;
+
+        if (req.query.format === "aixm") {
+            body.results = items.map((item) => {
+                if (item.status !== "completed") {
+                    return { index: item.index, status: "failed", error: item.error };
+                }
+
+                try {
+                    return {
+                        index: item.index,
+                        status: "completed",
+                        aixm: generateAixmRoute(item.result, job.airacCycle, job.flightDate)
+                    };
+                } catch (error) {
+                    if (!(error instanceof UnserializableRouteError)) {
+                        throw error;
+                    }
+
+                    return { index: item.index, status: "unserializable", error: error.message };
+                }
+            });
+        } else {
+            body.results = items.map((item) => ({
+                index: item.index,
+                status: item.status,
+                ...(item.failedRowCount !== undefined ? { failedRowCount: item.failedRowCount } : {}),
+                ...(item.result !== undefined ? { result: item.result } : {}),
+                ...(item.error !== undefined ? { error: item.error } : {})
+            }));
+        }
+
+        return res.json(body);
+    } catch (error) {
+        console.error("Batch job retrieval failed:", error);
+        return res.status(500).json({ error: "Failed to retrieve batch job." });
     }
 });
 
@@ -248,7 +414,9 @@ app.post("/api/ocr", requireAuth, (req, res, next) => {
 
         const base64Image = req.file.buffer.toString("base64");
         const response = await openai.chat.completions.create({
-            model: "gpt-4o",
+            // OCR needs a vision-capable model; the configured model must
+            // support image inputs when this route is used.
+            model: LLM_MODEL_NAME,
             temperature: 0,
             top_p: 0.1,
             messages: [
@@ -278,16 +446,6 @@ async function seedDatabase() {
     }
 }
 
-function getProcedureAirportCode(procedure) {
-    const airportCode = procedure.airportCode || procedure.source?.airportCode || procedure.airport?.icao;
-
-    if (typeof airportCode !== "string" || airportCode.trim() === "") {
-        throw new DataIntegrityError("Procedure airportCode is required for spatial trigger resolution.");
-    }
-
-    return airportCode.trim();
-}
-
 function getAirportQuery(airportCode) {
     return {
         $or: [
@@ -295,81 +453,6 @@ function getAirportQuery(airportCode) {
             { "source.airportCode": airportCode },
             { "airport.icao": airportCode }
         ]
-    };
-}
-
-/** Optional flightDate from an API payload: undefined passes through (query layer defaults to now). */
-function parseFlightDate(rawFlightDate) {
-    if (rawFlightDate === undefined || rawFlightDate === null) {
-        return undefined;
-    }
-
-    const date = new Date(rawFlightDate);
-
-    if (!Number.isFinite(date.getTime())) {
-        throw new Error(`Invalid flightDate: ${rawFlightDate}. Expected an ISO-8601 date string.`);
-    }
-
-    return date;
-}
-
-async function enrichProcedureWithSpatialTriggers(procedure, flightDate) {
-    if (!procedure?.procedureRows) {
-        return procedure;
-    }
-
-    const airportCode = getProcedureAirportCode(procedure);
-
-    // Per-row enrichment: a ground-truth gap in one row (e.g. a runway missing
-    // from the nav database) must not abort the entire procedure. Each row
-    // carries its own integrity report; failed rows keep their raw segments.
-    return {
-        ...procedure,
-        procedureRows: await Promise.all(procedure.procedureRows.map(async (row) => {
-            try {
-                return {
-                    ...row,
-                    geometry: {
-                        ...row.geometry,
-                        segments: await Promise.all((row.geometry?.segments || []).map((segment) =>
-                            enrichSegmentWithSpatialTrigger(segment, row, { airportCode, flightDate })
-                        ))
-                    },
-                    integrity: { status: "enriched", errors: [] }
-                };
-            } catch (error) {
-                if (!(error instanceof DataIntegrityError)) {
-                    throw error;
-                }
-
-                console.warn(`Row ${row.rowId || "(unidentified)"} enrichment failed: ${error.message}`);
-
-                return {
-                    ...row,
-                    integrity: {
-                        status: "failed",
-                        errors: [`${error.name}: ${error.message}`]
-                    }
-                };
-            }
-        }))
-    };
-}
-
-async function enrichSegmentWithSpatialTrigger(segment, row, context) {
-    if (!segment?.spatialTrigger) {
-        return segment;
-    }
-
-    const computedSpatialTrigger = await segmentProcessor.process(segment, row, context);
-
-    if (!computedSpatialTrigger) {
-        return segment;
-    }
-
-    return {
-        ...segment,
-        computedSpatialTrigger
     };
 }
 

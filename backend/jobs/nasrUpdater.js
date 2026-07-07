@@ -23,6 +23,12 @@
  *   4. Garbage-collects: any cycle whose effectiveTo is more than 48 hours
  *      in the past is wiped with deleteMany, along with legacy documents
  *      from the old single-cycle schema (no airacCycle stamp).
+ *
+ * Air-gapped sideload mode: when NASR_LOCAL_ZIP_PATH is set, the network is
+ * never touched. Each run instead looks for a NASR CSV zip at that path
+ * (dropped into a mounted volume by the operator), ingests it — the data's
+ * own EFF_DATE determines the cycle — and renames it with a .processed
+ * suffix so it is not re-ingested on subsequent runs.
  */
 const fs = require("fs");
 const os = require("os");
@@ -146,34 +152,30 @@ async function isCycleIngested(db, cycle) {
 }
 
 /**
- * Downloads, parses, and inserts one AIRAC cycle into nav_data.
+ * Extracts, parses, and commits one NASR zip into nav_data. Shared by the
+ * network and sideload ingestion paths.
  *
  * Insertion order is the safety mechanism: data documents first, the
  * metadata doc last as the commit point. determineActiveCycle only resolves
  * cycles through metadata docs, so a crash mid-insert leaves an invisible
  * partial cycle (cleared by the residue wipe on the next attempt), never a
  * queryable half-dataset.
+ *
+ * @returns {string} the committed cycle ident (from the data's own EFF_DATE)
  */
-async function ingestCycle(db, cycle, workDir) {
-    const url = buildDownloadUrl(cycle);
-    const zipPath = path.join(workDir, `nasr_${cycle.ident}.zip`);
-
-    log("info", `Ingesting AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom}).`);
-    await downloadWithRetry(url, zipPath);
-
-    const extractDir = path.join(workDir, `csv_${cycle.ident}`);
+async function commitZip(db, zipPath, extractDir) {
     extractZip(zipPath, extractDir);
 
     log("info", "Running NASR ETL against extracted CSVs ...");
     const { database } = buildNavDatabase(extractDir);
     const { airacCycle, metaDoc, navaidDocs, runwayDocs } = buildNavDataDocuments(database);
 
-    if (airacCycle !== cycle.ident) {
-        // The data's own EFF_DATE is authoritative over the URL we targeted.
-        log("warn", `Requested cycle ${cycle.ident} but NASR data declares ${airacCycle}; ingesting as ${airacCycle}.`);
-    }
-
     const live = db.collection(LIVE_COLLECTION);
+
+    if (await live.findOne({ _id: metaDoc._id })) {
+        log("info", `AIRAC cycle ${airacCycle} is already ingested; skipping re-insert.`);
+        return airacCycle;
+    }
 
     // Clear residue from a previously interrupted ingestion of this cycle.
     await live.deleteMany({ airacCycle });
@@ -202,6 +204,50 @@ async function ingestCycle(db, cycle, workDir) {
 
     log("info", `Cycle ${airacCycle} committed: ${navaidCount} navaid idents, ${runwayCount} runway ends ` +
         `(effective ${metaDoc.effectiveFrom} -> ${metaDoc.effectiveTo}).`);
+
+    return airacCycle;
+}
+
+/** Downloads and commits one AIRAC cycle from the FAA (online mode). */
+async function ingestCycle(db, cycle, workDir) {
+    const url = buildDownloadUrl(cycle);
+    const zipPath = path.join(workDir, `nasr_${cycle.ident}.zip`);
+
+    log("info", `Ingesting AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom}).`);
+    await downloadWithRetry(url, zipPath);
+
+    const committedCycle = await commitZip(db, zipPath, path.join(workDir, `csv_${cycle.ident}`));
+
+    if (committedCycle !== cycle.ident) {
+        // The data's own EFF_DATE is authoritative over the URL we targeted.
+        log("warn", `Requested cycle ${cycle.ident} but NASR data declared ${committedCycle}.`);
+    }
+}
+
+/**
+ * Air-gapped sideload mode: ingests a NASR zip dropped into a mounted
+ * volume by the operator (NASR_LOCAL_ZIP_PATH). Never touches the network.
+ * The zip's own EFF_DATE determines the cycle. After processing, the file
+ * is renamed with a .processed suffix so the next cron pass does not
+ * re-ingest it — the drop path stays free for the next cycle's zip.
+ */
+async function ingestFromLocalZip(db, zipPath, workDir) {
+    const committedCycle = await commitZip(db, zipPath, path.join(workDir, "csv_sideload"));
+
+    markZipProcessed(zipPath);
+
+    return committedCycle;
+}
+
+function markZipProcessed(zipPath) {
+    let processedPath = `${zipPath}.processed`;
+
+    if (fs.existsSync(processedPath)) {
+        processedPath = `${zipPath}.processed-${Date.now()}`;
+    }
+
+    fs.renameSync(zipPath, processedPath);
+    log("info", `Sideload file marked as processed: ${path.basename(processedPath)}.`);
 }
 
 /**
@@ -248,23 +294,42 @@ async function runNasrUpdate(db) {
     let hardFailure = false;
 
     try {
-        const { current, upcoming } = targetCycles();
+        const localZipPath = process.env.NASR_LOCAL_ZIP_PATH;
 
-        for (const [label, cycle] of [["current", current], ["upcoming", upcoming]]) {
-            if (await isCycleIngested(db, cycle)) {
-                log("info", `AIRAC cycle ${cycle.ident} (${label}) already ingested; skipping.`);
-                continue;
-            }
-
-            try {
-                await ingestCycle(db, cycle, workDir);
-            } catch (error) {
-                if (error.notPublished && label === "upcoming") {
-                    log("info", `Upcoming cycle ${cycle.ident} not published by the FAA yet; will retry on the next run.`);
-                } else {
+        if (localZipPath) {
+            // Air-gapped deployment: the network is never touched, even when
+            // no drop file is present — freshness is the operator's duty.
+            if (fs.existsSync(localZipPath) && fs.statSync(localZipPath).isFile() && localZipPath.toLowerCase().endsWith(".zip")) {
+                try {
+                    const committedCycle = await ingestFromLocalZip(db, localZipPath, workDir);
+                    log("info", `Sideload ingestion complete: AIRAC cycle ${committedCycle} from ${path.basename(localZipPath)}.`);
+                } catch (error) {
                     hardFailure = true;
-                    log("error", `HARD FAILURE: ingestion of ${label} cycle ${cycle.ident} aborted. ` +
+                    log("error", `HARD FAILURE: sideload ingestion of ${localZipPath} aborted. ` +
                         `Existing cycles in nav_data are untouched. Cause: ${error.message}`);
+                }
+            } else {
+                log("info", `Sideload mode (NASR_LOCAL_ZIP_PATH set): no .zip file at ${localZipPath}; nothing to ingest this run.`);
+            }
+        } else {
+            const { current, upcoming } = targetCycles();
+
+            for (const [label, cycle] of [["current", current], ["upcoming", upcoming]]) {
+                if (await isCycleIngested(db, cycle)) {
+                    log("info", `AIRAC cycle ${cycle.ident} (${label}) already ingested; skipping.`);
+                    continue;
+                }
+
+                try {
+                    await ingestCycle(db, cycle, workDir);
+                } catch (error) {
+                    if (error.notPublished && label === "upcoming") {
+                        log("info", `Upcoming cycle ${cycle.ident} not published by the FAA yet; will retry on the next run.`);
+                    } else {
+                        hardFailure = true;
+                        log("error", `HARD FAILURE: ingestion of ${label} cycle ${cycle.ident} aborted. ` +
+                            `Existing cycles in nav_data are untouched. Cause: ${error.message}`);
+                    }
                 }
             }
         }
