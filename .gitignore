@@ -1,2 +1,6 @@
 node_modules/
 .env
+
+# NASR sideload drop zone: operators mount FAA zips here; never commit them.
+nasr_dropzone/*
+!nasr_dropzone/.gitkeep

@@ -19,10 +19,20 @@ const { segmentProcessor, DataIntegrityError } = require("./geo_engine");
 
 const LLM_BASE_URL = process.env.LLM_BASE_URL || undefined;
 const LLM_MODEL_NAME = process.env.LLM_MODEL_NAME || "gpt-4o";
+
+// Fail at boot with a clear message rather than letting the SDK throw a
+// cryptic credentials error: some LLM routing must be configured.
+if (!process.env.OPENAI_API_KEY && !LLM_BASE_URL) {
+    console.error(
+        "CRITICAL FATAL: No LLM configured. Set LLM_BASE_URL (local/enterprise endpoint) or OPENAI_API_KEY."
+    );
+    process.exit(1);
+}
+
 const openai = new OpenAI({
     ...(LLM_BASE_URL ? { baseURL: LLM_BASE_URL } : {}),
     // The SDK requires a key even for local endpoints that ignore it.
-    apiKey: process.env.OPENAI_API_KEY || (LLM_BASE_URL ? "local-endpoint-no-key" : undefined)
+    apiKey: process.env.OPENAI_API_KEY || "local-endpoint-no-key"
 });
 
 /** Runs the deterministic chart-text extraction and returns the parsed procedure. */

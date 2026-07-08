@@ -1,5 +1,13 @@
 require("dotenv").config();
 
+// Production hard gate: the API must never come up guarded by a missing or
+// hardcoded credential. Checked before any module wiring so the failure is
+// the first and only line an operator sees.
+if (!process.env.ADMIN_API_KEY) {
+    console.error("CRITICAL FATAL: ADMIN_API_KEY is not set. Refusing to start with unauthenticated admin routes.");
+    process.exit(1);
+}
+
 const express = require("express");
 const { MongoClient } = require("mongodb");
 const multer = require("multer");
@@ -20,6 +28,10 @@ const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExp
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// OCR requires a vision-capable model; air-gapped deployments with a
+// text-only local LLM must disable it explicitly (default: disabled).
+const OCR_ENABLED = process.env.ENABLE_OCR === "true";
 
 // VULNERABILITY #3 PATCH: The Memory Bomb
 // Enforce strict 5MB limit and reject non-image MIME types
@@ -55,7 +67,13 @@ async function connectDB() {
         db = client.db("emproview");
         console.log("Connected to MongoDB");
         initNavDb(db); // Point the geodetic ground-truth layer at live nav_data
-        await seedDatabase();
+
+        // Demo seeding is a development convenience only: production
+        // containers must start with an empty procedures collection.
+        if (process.env.SEED_DEMO_DATA === "true") {
+            await seedDatabase();
+        }
+
         initNasrUpdater(db); // Weekly NASR ingestion + startup AIRAC catch-up
         initBatchWorker(db); // Persistent async batch queue (resumes orphaned jobs)
     } catch (error) {
@@ -392,6 +410,12 @@ app.get("/api/extract/batch/:jobId", requireAuth, async (req, res) => {
 
 // Multer error handling middleware wrapper for the OCR route
 app.post("/api/ocr", requireAuth, (req, res, next) => {
+    if (!OCR_ENABLED) {
+        return res.status(501).json({
+            error: "OCR disabled in this deployment environment. A vision-capable model is not configured."
+        });
+    }
+
     upload.single("image")(req, res, (err) => {
         if (err instanceof multer.MulterError) {
             return res.status(400).json({ error: `Upload error: ${err.message}` });

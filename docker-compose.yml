@@ -1,0 +1,83 @@
+# EmProView air-gapped enterprise stack: one `docker compose up -d`.
+#
+#   app    Node server + in-process background workers (NASR updater,
+#          batch queue worker)
+#   mongo  multi-cycle nav_data ground truth, procedures, batch queue
+#   llm    local Ollama inference — chart-text extraction never leaves
+#          this network
+#
+# Secrets: ADMIN_API_KEY must be provided by the operator (shell export or
+# an .env file next to this compose file). Startup refuses to run without it.
+#
+# Air-gap note: the llm service pulls its model from the Ollama registry on
+# FIRST start only (the model persists in the ollama_models volume). For a
+# truly offline site, run the first start on a connected staging host and
+# ship the populated volume — or `docker save` a committed image — so no
+# network is ever needed on-site.
+#
+# NASR sideloading: drop the FAA 28-day CSV zip into ./nasr_dropzone as
+# nasr.zip. The updater ingests it and renames it *.processed. Because
+# NASR_LOCAL_ZIP_PATH is set, the app never attempts the FAA download.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/emproview
+      LLM_BASE_URL: http://llm:11434/v1
+      LLM_MODEL_NAME: llama3
+      ENABLE_OCR: "false"
+      SEED_DEMO_DATA: "false"
+      NASR_LOCAL_ZIP_PATH: /app/dropzone/nasr.zip
+      BATCH_CONCURRENCY: "1"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in the deployment environment}
+    volumes:
+      - ./nasr_dropzone:/app/dropzone
+    depends_on:
+      mongo:
+        condition: service_healthy
+      llm:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mongo:
+    image: mongo:latest
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  llm:
+    image: ollama/ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    # Start the server, ensure the model is present (no-op once the volume
+    # holds it), then keep serving.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        SERVER_PID=$$!
+        sleep 5
+        ollama pull llama3
+        wait $$SERVER_PID
+
+volumes:
+  mongo_data:
+  ollama_models:
