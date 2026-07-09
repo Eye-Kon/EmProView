@@ -106,6 +106,23 @@ async function connectDB() {
 
 connectDB();
 
+// Allow the Vite mapping UI (separate origin in dev) to call /api routes.
+app.use((req, res, next) => {
+    if (!req.path.startsWith("/api")) {
+        return next();
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(204);
+    }
+
+    return next();
+});
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 

@@ -1,6 +1,11 @@
 node_modules/
 .env
 
+# React mapping frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
 # NASR sideload drop zone: operators mount FAA zips here; never commit them.
 nasr_dropzone/*
 !nasr_dropzone/.gitkeep
