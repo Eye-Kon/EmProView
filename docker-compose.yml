@@ -30,10 +30,15 @@ services:
       LLM_BASE_URL: http://llm:11434/v1
       LLM_MODEL_NAME: llama3
       ENABLE_OCR: "false"
-      SEED_DEMO_DATA: "false"
+      # Pulled from the .env file next to this compose file; defaults to
+      # "false" so production stacks never seed demo procedures by accident.
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-false}
+      # Injected at runtime from the host environment or the .env file next
+      # to this compose file — never baked into the image at build time.
+      # The :? guard makes compose refuse to start if the key is missing.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in the deployment environment}
       NASR_LOCAL_ZIP_PATH: /app/dropzone/nasr.zip
       BATCH_CONCURRENCY: "1"
-      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in the deployment environment}
     volumes:
       - ./nasr_dropzone:/app/dropzone
     depends_on:

@@ -12,7 +12,10 @@ const express = require("express");
 const { MongoClient } = require("mongodb");
 const multer = require("multer");
 const path = require("path");
-const { AiracExpiredError } = require("./backend/geo_engine");
+const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
+const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
+const { requireFiniteNumber, requireNonEmptyString } = require("./backend/geo/validation");
+const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
 const { createBatchJob, initBatchWorker, JOBS_COLLECTION, RESULTS_COLLECTION } = require("./backend/jobs/batchProcessor");
 const {
@@ -62,23 +65,42 @@ const client = new MongoClient(process.env.MONGODB_URI);
 let db;
 
 async function connectDB() {
+    // Failure domain 1: the database connection itself.
     try {
         await client.connect();
         db = client.db("emproview");
         console.log("Connected to MongoDB");
-        initNavDb(db); // Point the geodetic ground-truth layer at live nav_data
-
-        // Demo seeding is a development convenience only: production
-        // containers must start with an empty procedures collection.
-        if (process.env.SEED_DEMO_DATA === "true") {
-            await seedDatabase();
-        }
-
-        initNasrUpdater(db); // Weekly NASR ingestion + startup AIRAC catch-up
-        initBatchWorker(db); // Persistent async batch queue (resumes orphaned jobs)
     } catch (error) {
         console.error("CRITICAL FATAL: Failed to connect to MongoDB", error);
         process.exit(1); // Force server to crash if DB isn't available, preventing ghost state
+    }
+
+    // Failure domain 2: downstream service initialization. Each step is
+    // labeled so a startup crash names the component that actually threw,
+    // instead of masquerading as a connection failure.
+    const initSteps = [
+        // Point the geodetic ground-truth layer at live nav_data
+        ["initNavDb (geodetic ground-truth layer)", () => initNavDb(db)],
+        // Demo seeding is a development convenience only: production
+        // containers must start with an empty procedures collection.
+        ["seedDatabase (demo data seeder)", async () => {
+            if (process.env.SEED_DEMO_DATA === "true") {
+                await seedDatabase();
+            }
+        }],
+        // Weekly NASR ingestion + startup AIRAC catch-up
+        ["initNasrUpdater (NASR ingestion scheduler)", () => initNasrUpdater(db)],
+        // Persistent async batch queue (resumes orphaned jobs)
+        ["initBatchWorker (batch extraction queue)", () => initBatchWorker(db)]
+    ];
+
+    for (const [componentName, step] of initSteps) {
+        try {
+            await step();
+        } catch (error) {
+            console.error(`CRITICAL FATAL: Startup initialization failed in ${componentName}`, error);
+            process.exit(1); // A partially initialized server must not serve traffic
+        }
     }
 }
 
@@ -405,6 +427,223 @@ app.get("/api/extract/batch/:jobId", requireAuth, async (req, res) => {
     } catch (error) {
         console.error("Batch job retrieval failed:", error);
         return res.status(500).json({ error: "Failed to retrieve batch job." });
+    }
+});
+
+// Auth guard for /api/analyze. Unlike requireAuth (403), this route's
+// contract specifies 401 Unauthorized for a missing or invalid key.
+function requireAnalyzeAuth(req, res, next) {
+    const apiKey = req.get("x-api-key");
+
+    if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    return next();
+}
+
+/**
+ * Parses the Ollama response into the relational-logic contract. The LLM is
+ * an untrusted boundary: its output is treated exactly like external input.
+ * Anything that is not strict, complete JSON with coherent turn semantics is
+ * a DataIntegrityError (-> 422), never a silent default.
+ */
+function parseRelationalLogic(rawResponse) {
+    // Tolerate a fenced/prefixed reply by isolating the outermost JSON object,
+    // but nothing beyond that: the content itself must parse strictly.
+    const jsonMatch = typeof rawResponse === "string" ? rawResponse.match(/\{[\s\S]*\}/) : null;
+
+    if (!jsonMatch) {
+        throw new DataIntegrityError(
+            `LLM extraction did not produce a JSON object of relational logic. Raw response: ${String(rawResponse).slice(0, 200)}`
+        );
+    }
+
+    let extraction;
+
+    try {
+        extraction = JSON.parse(jsonMatch[0]);
+    } catch {
+        throw new DataIntegrityError(
+            `LLM extraction produced malformed JSON. Raw response: ${jsonMatch[0].slice(0, 200)}`
+        );
+    }
+
+    const triggerDistanceNM = requireFiniteNumber(extraction.trigger_distance_nm, "llmExtraction.trigger_distance_nm");
+    const rawDirection = typeof extraction.turn_direction === "string"
+        ? extraction.turn_direction.trim().toLowerCase()
+        : null;
+
+    let turn = null;
+
+    if (rawDirection === "left" || rawDirection === "right") {
+        turn = {
+            turnDirection: rawDirection,
+            magneticHeading: requireFiniteNumber(
+                extraction.target_magnetic_heading,
+                "llmExtraction.target_magnetic_heading"
+            )
+        };
+    } else if (rawDirection !== null && rawDirection !== "none" && rawDirection !== "not_applicable") {
+        throw new DataIntegrityError(
+            `LLM extraction returned an incoherent turn_direction: ${extraction.turn_direction}. Expected LEFT, RIGHT, or NONE.`
+        );
+    }
+
+    return { extraction, triggerDistanceNM, turn };
+}
+
+// Bridges the extraction, ground-truth, and spatial calculation layers:
+//   Stage 1  LLM extraction of relational logic (local Ollama container,
+//            native /api/generate via the Docker service name http://llm:11434).
+//   Stage 3  Validated physical ground truth (groundTruthService) — AIRAC
+//            currency is enforced before any spatial query runs.
+//   Stage 4  Deterministic WGS-84 solving (GeoMath + PathGeometry).
+// No stage degrades gracefully: expired, missing, or non-finite physical
+// data rejects the computation with a 422 and the exact failure message.
+app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
+    const {
+        procedure_text: procedureText,
+        extraction_target: extractionTarget,
+        airportId,
+        runwayId,
+        navaidId
+    } = req.body || {};
+
+    const missing = [
+        ["procedure_text", procedureText],
+        ["extraction_target", extractionTarget],
+        ["airportId", airportId],
+        ["runwayId", runwayId],
+        ["navaidId", navaidId]
+    ].filter(([, value]) => typeof value !== "string" || value.trim() === "").map(([name]) => name);
+
+    if (missing.length > 0) {
+        return res.status(400).json({
+            error: `Missing required fields: ${missing.join(", ")}. ` +
+                `procedure_text, extraction_target, airportId, runwayId, and navaidId must all be provided.`
+        });
+    }
+
+    const prompt =
+        `You are a precision aviation data extraction tool.\n` +
+        `From the procedure text below, extract the relational logic of the procedure, ` +
+        `with particular focus on: ${extractionTarget}.\n\n` +
+        `PROCEDURE TEXT:\n${procedureText}\n\n` +
+        `Respond with ONLY a single JSON object in exactly this shape:\n` +
+        `{"extracted_value": "<the value of ${extractionTarget}>", ` +
+        `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
+        `"trigger_distance_nm": <the DME distance in nautical miles at which the action occurs, as a number>, ` +
+        `"target_magnetic_heading": <the commanded magnetic heading or course after the action as a number, or null if none>}\n` +
+        `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
+        `Output the raw JSON object and nothing else.`;
+
+    // Stage 1: LLM extraction. Infrastructure failure here is a 500 — the
+    // inference container is a server-side dependency, not a data problem.
+    let rawLlmResponse;
+
+    try {
+        const llmResponse = await fetch("http://llm:11434/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                model: process.env.LLM_MODEL_NAME || "llama3",
+                prompt,
+                stream: false,
+                format: "json"
+            }),
+            // Local CPU inference can be slow; abort rather than hang forever.
+            signal: AbortSignal.timeout(120_000)
+        });
+
+        if (!llmResponse.ok) {
+            throw new Error(`Ollama returned HTTP ${llmResponse.status} ${llmResponse.statusText}`);
+        }
+
+        rawLlmResponse = ((await llmResponse.json()).response || "").trim();
+    } catch (error) {
+        console.error(`LLM analyze request failed (${error.name}): ${error.message}`);
+        return res.status(500).json({ error: "LLM analysis failed. The inference container did not return a result." });
+    }
+
+    try {
+        const { extraction, triggerDistanceNM, turn } = parseRelationalLogic(rawLlmResponse);
+
+        // Stage 3: validated physical ground truth. AIRAC temporal enforcement
+        // runs first inside the service; an expired cycle or any missing /
+        // non-finite physical field throws before spatial math is reached.
+        const groundTruth = await resolvePhysicalGroundTruth(
+            airportId.trim(),
+            runwayId.trim(),
+            navaidId.trim(),
+            new Date().toISOString()
+        );
+
+        const origin = {
+            latitude: groundTruth.originRunway.threshold.latitude,
+            longitude: groundTruth.originRunway.threshold.longitude
+        };
+        const departureTrueHeading = groundTruth.originRunway.trueHeading;
+
+        // Stage 4: deterministic WGS-84 solving. The trigger point is the
+        // forward intersection of the departure track with the DME arc around
+        // the validated navaid station.
+        const intersection = GeoMath.calculateTrackCircleIntersection(
+            origin,
+            departureTrueHeading,
+            groundTruth.navaid.coordinates,
+            triggerDistanceNM
+        );
+        const triggerPoint = { latitude: intersection.latitude, longitude: intersection.longitude };
+
+        let resolvedTurn = null;
+
+        if (turn) {
+            // True North normalization: the LLM's magnetic heading is converted
+            // to True using database ground truth before it touches spatial math.
+            const targetTrueHeading = GeoMath.magneticToTrue(turn.magneticHeading, groundTruth.magneticVariation);
+            const turnEvaluation = GeoMath.getAngularDifference(
+                departureTrueHeading,
+                targetTrueHeading,
+                turn.turnDirection
+            );
+
+            resolvedTurn = {
+                targetTrueHeading: turnEvaluation.targetHeading,
+                turnDegrees: turnEvaluation.turnDegrees,
+                turnDirection: turnEvaluation.turnDirection
+            };
+        }
+
+        const path = buildTriggeredTurnPath({
+            origin,
+            triggerPoint,
+            departureTrueHeading,
+            turn: resolvedTurn,
+            runway: groundTruth.originRunway.runwayId
+        });
+
+        return res.json({
+            extraction,
+            airacCycle: groundTruth.airacCycle,
+            triggerPoint: {
+                ...triggerPoint,
+                distanceAlongTrackNM: intersection.distanceAlongTrackNM,
+                dmeErrorNM: intersection.dmeErrorNM
+            },
+            parametric: path.parametric,
+            geojson: path.geojson,
+            disambiguation: groundTruth.disambiguation
+        });
+    } catch (error) {
+        // AiracExpiredError subclasses DataIntegrityError: both are structural
+        // rejections of the computation, never generic server faults.
+        if (error instanceof DataIntegrityError) {
+            return res.status(422).json({ error: error.message });
+        }
+
+        console.error(`Analyze pipeline failed (${error.name}): ${error.message}`);
+        return res.status(500).json({ error: "Analysis pipeline failed unexpectedly." });
     }
 });
 
