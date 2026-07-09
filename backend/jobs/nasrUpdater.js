@@ -15,11 +15,13 @@
  *      to the OS temp directory, retrying with exponential backoff (max 3
  *      attempts). An unpublished upcoming cycle (404) is not a failure —
  *      it is retried on the next run.
- *   3. Extracts the CSVs, parses them via scripts/etl_nasr.js, and inserts
- *      the documents directly into `nav_data`. The cycle's metadata doc is
- *      inserted LAST, only after the data documents are verified — queries
- *      resolve cycles through their metadata, so a half-inserted cycle is
- *      invisible and live queries keep zero-downtime semantics.
+ *   3. Streams the zip straight into `nav_data` via utils/nasrUpdater.js
+ *      (ingestNasrZip): no disk extraction, no full-file buffering —
+ *      entries are decompressed and parsed row-by-row, inserted in bulk
+ *      batches. The cycle's metadata doc is inserted LAST, only after the
+ *      data documents are verified — queries resolve cycles through their
+ *      metadata, so a half-inserted cycle is invisible and live queries
+ *      keep zero-downtime semantics.
  *   4. Garbage-collects: any cycle whose effectiveTo is more than 48 hours
  *      in the past is wiped with deleteMany, along with legacy documents
  *      from the old single-cycle schema (no airacCycle stamp).
@@ -35,16 +37,14 @@ const os = require("os");
 const path = require("path");
 const axios = require("axios");
 const cron = require("node-cron");
-const AdmZip = require("adm-zip");
 const { getCycleForDate, CYCLE_LENGTH_MS } = require("../../utils/airac");
-const { buildNavDatabase, buildNavDataDocuments } = require("../../scripts/etl_nasr");
+const { ingestNasrZip } = require("../../utils/nasrUpdater");
 
 const LIVE_COLLECTION = "nav_data";
 const CRON_SCHEDULE = "0 8 * * 2"; // Every Tuesday 08:00 UTC
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 5000;
 const DOWNLOAD_TIMEOUT_MS = 120000;
-const INSERT_BATCH_SIZE = 5000;
 // Grace period after effectiveTo before a cycle is purged: keeps just-expired
 // ground truth available for in-flight work and clock-skew safety.
 const GC_GRACE_MS = 48 * 60 * 60 * 1000;
@@ -140,11 +140,6 @@ async function downloadWithRetry(url, destinationPath) {
     }
 }
 
-function extractZip(zipPath, extractDir) {
-    log("info", `Extracting ${path.basename(zipPath)} ...`);
-    new AdmZip(zipPath).extractAllTo(extractDir, true);
-}
-
 async function isCycleIngested(db, cycle) {
     const meta = await db.collection(LIVE_COLLECTION).findOne({ _id: `airac_${cycle.ident}` });
 
@@ -152,58 +147,24 @@ async function isCycleIngested(db, cycle) {
 }
 
 /**
- * Extracts, parses, and commits one NASR zip into nav_data. Shared by the
- * network and sideload ingestion paths.
+ * Commits one NASR zip into nav_data by streaming it through
+ * utils/nasrUpdater.js (ingestNasrZip). Shared by the network and sideload
+ * ingestion paths. Nothing is extracted to disk and no file is buffered in
+ * memory; documents flow to MongoDB in bulk batches.
  *
- * Insertion order is the safety mechanism: data documents first, the
- * metadata doc last as the commit point. determineActiveCycle only resolves
- * cycles through metadata docs, so a crash mid-insert leaves an invisible
- * partial cycle (cleared by the residue wipe on the next attempt), never a
+ * All commit-safety semantics live inside ingestNasrZip: skip when the
+ * cycle's metadata doc already exists, wipe residue from an interrupted
+ * attempt, verify counts, and insert the metadata doc LAST as the commit
+ * point. determineActiveCycle only resolves cycles through metadata docs,
+ * so a crash mid-stream leaves an invisible partial cycle, never a
  * queryable half-dataset.
  *
  * @returns {string} the committed cycle ident (from the data's own EFF_DATE)
  */
-async function commitZip(db, zipPath, extractDir) {
-    extractZip(zipPath, extractDir);
+async function commitZip(db, zipPath) {
+    log("info", `Streaming ${path.basename(zipPath)} into ${LIVE_COLLECTION} ...`);
 
-    log("info", "Running NASR ETL against extracted CSVs ...");
-    const { database } = buildNavDatabase(extractDir);
-    const { airacCycle, metaDoc, navaidDocs, runwayDocs } = buildNavDataDocuments(database);
-
-    const live = db.collection(LIVE_COLLECTION);
-
-    if (await live.findOne({ _id: metaDoc._id })) {
-        log("info", `AIRAC cycle ${airacCycle} is already ingested; skipping re-insert.`);
-        return airacCycle;
-    }
-
-    // Clear residue from a previously interrupted ingestion of this cycle.
-    await live.deleteMany({ airacCycle });
-
-    for (const docs of [navaidDocs, runwayDocs]) {
-        for (let i = 0; i < docs.length; i += INSERT_BATCH_SIZE) {
-            await live.insertMany(docs.slice(i, i + INSERT_BATCH_SIZE), { ordered: false });
-        }
-    }
-
-    // Verify the data documents landed completely before committing the cycle.
-    const navaidCount = await live.countDocuments({ airacCycle, docType: "navaid" });
-    const runwayCount = await live.countDocuments({ airacCycle, docType: "runway" });
-
-    if (navaidCount !== navaidDocs.length || runwayCount !== runwayDocs.length || navaidCount === 0 || runwayCount === 0) {
-        await live.deleteMany({ airacCycle });
-        throw new Error(
-            `Cycle ${airacCycle} verification failed: navaids ${navaidCount}/${navaidDocs.length}, ` +
-            `runways ${runwayCount}/${runwayDocs.length}. Partial insert rolled back.`
-        );
-    }
-
-    await live.insertOne(metaDoc);
-    await live.createIndex({ docType: 1, airacCycle: 1, identifier: 1 });
-    await live.createIndex({ docType: 1, airacCycle: 1, key: 1 });
-
-    log("info", `Cycle ${airacCycle} committed: ${navaidCount} navaid idents, ${runwayCount} runway ends ` +
-        `(effective ${metaDoc.effectiveFrom} -> ${metaDoc.effectiveTo}).`);
+    const { airacCycle } = await ingestNasrZip(db, zipPath);
 
     return airacCycle;
 }
@@ -216,7 +177,7 @@ async function ingestCycle(db, cycle, workDir) {
     log("info", `Ingesting AIRAC cycle ${cycle.ident} (effective ${cycle.effectiveFrom}).`);
     await downloadWithRetry(url, zipPath);
 
-    const committedCycle = await commitZip(db, zipPath, path.join(workDir, `csv_${cycle.ident}`));
+    const committedCycle = await commitZip(db, zipPath);
 
     if (committedCycle !== cycle.ident) {
         // The data's own EFF_DATE is authoritative over the URL we targeted.
@@ -231,8 +192,8 @@ async function ingestCycle(db, cycle, workDir) {
  * is renamed with a .processed suffix so the next cron pass does not
  * re-ingest it — the drop path stays free for the next cycle's zip.
  */
-async function ingestFromLocalZip(db, zipPath, workDir) {
-    const committedCycle = await commitZip(db, zipPath, path.join(workDir, "csv_sideload"));
+async function ingestFromLocalZip(db, zipPath) {
+    const committedCycle = await commitZip(db, zipPath);
 
     markZipProcessed(zipPath);
 
@@ -301,7 +262,7 @@ async function runNasrUpdate(db) {
             // no drop file is present — freshness is the operator's duty.
             if (fs.existsSync(localZipPath) && fs.statSync(localZipPath).isFile() && localZipPath.toLowerCase().endsWith(".zip")) {
                 try {
-                    const committedCycle = await ingestFromLocalZip(db, localZipPath, workDir);
+                    const committedCycle = await ingestFromLocalZip(db, localZipPath);
                     log("info", `Sideload ingestion complete: AIRAC cycle ${committedCycle} from ${path.basename(localZipPath)}.`);
                 } catch (error) {
                     hardFailure = true;
