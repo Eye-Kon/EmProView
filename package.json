@@ -13,6 +13,7 @@
   "dependencies": {
     "@turf/turf": "^7.3.5",
     "axios": "^1.18.1",
+    "cors": "^2.8.6",
     "csv-parser": "^3.2.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
