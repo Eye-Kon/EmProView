@@ -16,6 +16,7 @@ const path = require("path");
 const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
 const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
 const { requireFiniteNumber, requireNonEmptyString } = require("./backend/geo/validation");
+const { resolveTriggerDistanceNM } = require("./backend/geo/resolveTriggerDistance");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
 const { createBatchJob, initBatchWorker, JOBS_COLLECTION, RESULTS_COLLECTION } = require("./backend/jobs/batchProcessor");
@@ -476,7 +477,20 @@ function parseRelationalLogic(rawResponse) {
         );
     }
 
-    const triggerDistanceNM = requireFiniteNumber(extraction.trigger_distance_nm, "llmExtraction.trigger_distance_nm");
+    // Lateral DME distance OR altitude-based trigger (mutually sufficient).
+    // Missing both rejects with DataIntegrityError → HTTP 422.
+    const triggerDistanceNM = resolveTriggerDistanceNM({
+        triggerDistanceNM: extraction.trigger_distance_nm,
+        triggerAltitudeMsl: extraction.trigger_altitude_msl,
+        climbGradientFtNm: extraction.climb_gradient_ft_nm,
+        distanceFieldPath: "llmExtraction.trigger_distance_nm",
+        altitudeFieldPath: "llmExtraction.trigger_altitude_msl"
+    });
+
+    // Feed the resolved NM back so altitude-only extractions payloads still
+    // carry a finite trigger_distance_nm for the existing 2D WGS-84 block.
+    extraction.trigger_distance_nm = triggerDistanceNM;
+
     const rawDirection = typeof extraction.turn_direction === "string"
         ? extraction.turn_direction.trim().toLowerCase()
         : null;
@@ -540,8 +554,17 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `Respond with ONLY a single JSON object in exactly this shape:\n` +
         `{"extracted_value": "<the value of ${extractionTarget}>", ` +
         `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
-        `"trigger_distance_nm": <the DME distance in nautical miles at which the action occurs, as a number>, ` +
+        `"trigger_distance_nm": <the DME/lateral distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
+        `"trigger_altitude_msl": <the altitude in feet MSL that triggers the action as a number, or null if not stated>, ` +
+        `"climb_gradient_ft_nm": <the climb gradient in feet per nautical mile if stated as a number, or null if not stated>, ` +
         `"target_magnetic_heading": <the commanded magnetic heading or course after the action as a number, or null if none>}\n` +
+        `TRIGGER RULES:\n` +
+        `- If the text states a physical/lateral/DME distance (e.g. "until 3.5 DME"), set trigger_distance_nm to that number.\n` +
+        `- If no physical distance is provided but an altitude restriction is stated ` +
+        `(e.g. "Climb to 4500 MSL before turning"), you MUST set trigger_altitude_msl to that altitude ` +
+        `and set trigger_distance_nm to null.\n` +
+        `- Extract climb_gradient_ft_nm only when the text explicitly states a climb gradient; otherwise null.\n` +
+        `- At least one of trigger_distance_nm or trigger_altitude_msl MUST be a number.\n` +
         `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
         `Output the raw JSON object and nothing else.`;
 

@@ -11,7 +11,12 @@ export interface AnalyzeRequest {
 export interface ExtractionResult {
   extracted_value: string
   turn_direction: 'LEFT' | 'RIGHT' | 'NONE'
+  /** Resolved lateral trigger distance (charted DME, or derived from altitude). */
   trigger_distance_nm: number
+  /** Altitude trigger in feet MSL when no lateral distance was charted. */
+  trigger_altitude_msl?: number | null
+  /** Climb gradient ft/NM when stated; engine defaults to 400 if omitted. */
+  climb_gradient_ft_nm?: number | null
   target_magnetic_heading: number | null
 }
 

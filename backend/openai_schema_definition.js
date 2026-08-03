@@ -80,12 +80,12 @@ const procedureSchema = {
                                             },
                                             spatialTrigger: {
                                                 type: ["object", "null"],
-                                                description: "Parametric COGO trigger for non-waypoint constraints. Use when the route is defined by a DME/radial/distance boundary instead of a named fix.",
+                                                description: "Parametric COGO trigger for non-waypoint constraints. Use when the route is defined by a DME/radial/distance OR altitude boundary instead of a named fix. Provide triggerDistanceNM when a lateral/DME distance is stated; when only an altitude restriction is stated (e.g. Climb to 4500 MSL before turning), set triggerDistanceNM to null and populate triggerAltitudeMsl.",
                                                 properties: {
                                                     triggerType: {
                                                         type: ["string", "null"],
                                                         enum: ["RADIAL_DISTANCE_INTERSECTION", null],
-                                                        description: "Use RADIAL_DISTANCE_INTERSECTION when an aircraft track intersects a DME radius from a reference NAVAID."
+                                                        description: "Use RADIAL_DISTANCE_INTERSECTION when an aircraft track intersects a DME radius from a reference NAVAID, or when an altitude trigger must be converted into an along-track distance for the same geometry."
                                                     },
                                                     referenceNavaid: {
                                                         type: ["string", "null"],
@@ -93,7 +93,15 @@ const procedureSchema = {
                                                     },
                                                     triggerDistanceNM: {
                                                         type: ["number", "null"],
-                                                        description: "DME distance in nautical miles from the reference NAVAID."
+                                                        description: "DME/lateral distance in nautical miles from the reference NAVAID. Null when the chart provides only an altitude trigger."
+                                                    },
+                                                    triggerAltitudeMsl: {
+                                                        type: ["number", "null"],
+                                                        description: "Altitude in feet MSL that triggers the action when no lateral/DME distance is stated (e.g. 4500). Null when a lateral distance is provided."
+                                                    },
+                                                    climbGradientFtNm: {
+                                                        type: ["number", "null"],
+                                                        description: "Climb gradient in feet per nautical mile when explicitly stated. Null if not provided; the engine defaults to 400 ft/NM."
                                                     },
                                                     resultingAction: {
                                                         type: ["object", "null"],
@@ -117,7 +125,14 @@ const procedureSchema = {
                                                         additionalProperties: false
                                                     }
                                                 },
-                                                required: ["triggerType", "referenceNavaid", "triggerDistanceNM", "resultingAction"],
+                                                required: [
+                                                    "triggerType",
+                                                    "referenceNavaid",
+                                                    "triggerDistanceNM",
+                                                    "triggerAltitudeMsl",
+                                                    "climbGradientFtNm",
+                                                    "resultingAction"
+                                                ],
                                                 additionalProperties: false
                                             },
                                             distanceNM: {

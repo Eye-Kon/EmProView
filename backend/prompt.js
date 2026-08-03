@@ -23,7 +23,8 @@ CRITICAL RULES:
 6. MERGED TABLE CELLS: Aviation charts frequently use merged cells in text tables to apply a single condition (like an altitude, DME distance, or turn heading) to multiple runways. If a cell spans multiple rows, you MUST apply that data to every runway it touches. Do not fragment the data.
 7. VISUAL SYNTHESIS: You must cross-reference the text table with the graphical map. If the table says 'D11.6 TCH' and the map shows the track turning left to '320 hdg' at that exact distance, you must combine both elements into a single continuous segment containing the trigger distance and the resulting turn.
 8. COGO COMPLETENESS: Never create a RADIAL_DISTANCE_INTERSECTION trigger without assigning the subsequent trackAction/resultingAction. They are a single mathematical event.
-9. HEADER METADATA: You must extract the operating airline (e.g., American Airlines, Delta), the specific procedure type (e.g., Engine Failure Takeoff, Missed Approach), and the aircraft applicability from the header and margins of the chart.
+9. ALTITUDE TRIGGERS: If a physical/lateral/DME distance is NOT provided but an altitude restriction is stated (e.g., "Climb to 4500 MSL before turning"), you MUST extract that altitude into spatialTrigger.triggerAltitudeMsl, set spatialTrigger.triggerDistanceNM to null, and still emit triggerType RADIAL_DISTANCE_INTERSECTION with the reference NAVAID and resultingAction. Extract climbGradientFtNm only when explicitly stated; otherwise null. At least one of triggerDistanceNM or triggerAltitudeMsl must be a number whenever a spatialTrigger is present.
+10. HEADER METADATA: You must extract the operating airline (e.g., American Airlines, Delta), the specific procedure type (e.g., Engine Failure Takeoff, Missed Approach), and the aircraft applicability from the header and margins of the chart.
 
 You will strictly adhere to the provided JSON Schema.
 `;

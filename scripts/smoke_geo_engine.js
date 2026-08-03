@@ -157,7 +157,7 @@ async function main() {
             DataIntegrityError
         );
 
-        // 6. Missing schema fields fail fast.
+        // 6. Missing schema fields fail fast (neither distance nor altitude).
         await assert.rejects(
             () =>
                 segmentProcessor.process(
@@ -166,6 +166,8 @@ async function main() {
                             triggerType: "RADIAL_DISTANCE_INTERSECTION",
                             referenceNavaid: "TCH",
                             triggerDistanceNM: null,
+                            triggerAltitudeMsl: null,
+                            climbGradientFtNm: null,
                             resultingAction: { turnDirection: "left", magneticHeading: 320 }
                         }
                     },
@@ -174,6 +176,17 @@ async function main() {
                 ),
             DataIntegrityError
         );
+
+        // 6b. Altitude-only trigger derives lateral NM before WGS-84 intersection.
+        {
+            const { resolveTriggerDistanceNM } = require("../backend/geo/resolveTriggerDistance");
+            const derived = resolveTriggerDistanceNM({
+                triggerDistanceNM: null,
+                triggerAltitudeMsl: 4500,
+                climbGradientFtNm: null
+            });
+            assert.ok(Math.abs(derived - (4500 - 748) / 400) < 1e-9, "altitude→NM derivation");
+        }
 
         // 7. Unknown ground truth (runway not in navDb) fails fast.
         await assert.rejects(

@@ -10,6 +10,7 @@
 const { GeoMath } = require("../GeoMath");
 const { buildTriggeredTurnPath } = require("../PathGeometry");
 const { requireField, requireFiniteNumber, requireNonEmptyString } = require("../validation");
+const { resolveTriggerDistanceNM } = require("../resolveTriggerDistance");
 const { DataIntegrityError } = require("../DataIntegrityError");
 
 const TRIGGER_TYPE = "RADIAL_DISTANCE_INTERSECTION";
@@ -26,10 +27,16 @@ async function solve(segment, row, context) {
         spatialTrigger.referenceNavaid,
         "segment.spatialTrigger.referenceNavaid"
     );
-    const triggerDistanceNM = requireFiniteNumber(
-        spatialTrigger.triggerDistanceNM,
-        "segment.spatialTrigger.triggerDistanceNM"
-    );
+    // Prefer charted DME/lateral distance; if missing, derive NM from
+    // altitude + climb gradient so the existing WGS-84 intersection runs unchanged.
+    const triggerDistanceNM = resolveTriggerDistanceNM({
+        triggerDistanceNM: spatialTrigger.triggerDistanceNM,
+        triggerAltitudeMsl: spatialTrigger.triggerAltitudeMsl,
+        climbGradientFtNm: spatialTrigger.climbGradientFtNm,
+        distanceFieldPath: "segment.spatialTrigger.triggerDistanceNM",
+        altitudeFieldPath: "segment.spatialTrigger.triggerAltitudeMsl"
+    });
+    spatialTrigger.triggerDistanceNM = triggerDistanceNM;
     const commandedTurn = resolveCommandedTurn(spatialTrigger.resultingAction);
 
     const runwayIdentifiers = requireField(row?.runways, "row.runways");
