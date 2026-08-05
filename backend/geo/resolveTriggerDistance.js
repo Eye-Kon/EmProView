@@ -4,8 +4,12 @@
  * Lateral procedures supply triggerDistanceNM directly. Altitude-based
  * procedures (e.g. "Climb to 4500 MSL before turning") omit distance; the
  * along-track NM is derived from altitude, field elevation, and climb gradient.
+ *
+ * Callers must pass already-optional-normalized values (null when absent).
+ * This helper never requires triggerDistanceNM — altitude alone is enough.
  */
 const { DataIntegrityError } = require("./DataIntegrityError");
+const { optionalFiniteNumber } = require("./validation");
 
 /** KCLT field elevation (ft MSL). */
 const FIELD_ELEVATION_FT = 748;
@@ -13,15 +17,11 @@ const FIELD_ELEVATION_FT = 748;
 /** Standard climb gradient (ft / NM) when the chart does not state one. */
 const DEFAULT_CLIMB_GRADIENT_FT_NM = 400;
 
-function isFiniteNumber(value) {
-    return typeof value === "number" && Number.isFinite(value);
-}
-
 /**
  * @param {object} params
- * @param {number|null|undefined} params.triggerDistanceNM
- * @param {number|null|undefined} params.triggerAltitudeMsl
- * @param {number|null|undefined} params.climbGradientFtNm
+ * @param {unknown} params.triggerDistanceNM  optional; null/undefined allowed
+ * @param {unknown} params.triggerAltitudeMsl optional; null/undefined allowed
+ * @param {unknown} params.climbGradientFtNm  optional; null/undefined allowed
  * @param {string} [params.distanceFieldPath]
  * @param {string} [params.altitudeFieldPath]
  * @returns {number} Positive finite trigger distance in NM
@@ -31,33 +31,37 @@ function resolveTriggerDistanceNM({
     triggerAltitudeMsl,
     climbGradientFtNm,
     distanceFieldPath = "trigger_distance_nm",
-    altitudeFieldPath = "trigger_altitude_msl"
+    altitudeFieldPath = "trigger_altitude_msl",
+    climbGradientFieldPath = "climb_gradient_ft_nm"
 }) {
-    if (isFiniteNumber(triggerDistanceNM)) {
-        return triggerDistanceNM;
-    }
+    // Normalize first — never call requireFiniteNumber on these optional fields.
+    const distance = optionalFiniteNumber(triggerDistanceNM, distanceFieldPath);
+    const altitude = optionalFiniteNumber(triggerAltitudeMsl, altitudeFieldPath);
+    const gradientRaw = optionalFiniteNumber(climbGradientFtNm, climbGradientFieldPath);
 
-    if (isFiniteNumber(triggerAltitudeMsl)) {
+    let resolved;
+
+    if (distance !== null) {
+        resolved = distance;
+    } else if (altitude !== null) {
         const gradient =
-            isFiniteNumber(climbGradientFtNm) && climbGradientFtNm > 0
-                ? climbGradientFtNm
+            gradientRaw !== null && gradientRaw > 0
+                ? gradientRaw
                 : DEFAULT_CLIMB_GRADIENT_FT_NM;
 
-        const distance = (triggerAltitudeMsl - FIELD_ELEVATION_FT) / gradient;
-
-        if (!Number.isFinite(distance) || distance <= 0) {
-            throw new DataIntegrityError(
-                `Computed ${distanceFieldPath} from altitude is not a positive finite number ` +
-                    `(altitude=${triggerAltitudeMsl}, fieldElevation=${FIELD_ELEVATION_FT}, gradient=${gradient}).`
-            );
-        }
-
-        return distance;
+        resolved = (altitude - FIELD_ELEVATION_FT) / gradient;
+    } else {
+        throw new DataIntegrityError(
+            `LLM extraction must include either ${distanceFieldPath} or ${altitudeFieldPath}.`
+        );
     }
 
-    throw new DataIntegrityError(
-        `LLM extraction must include either ${distanceFieldPath} or ${altitudeFieldPath}.`
-    );
+    // Hard circuit breaker: never hand NaN / <=0 / Infinity to the spatial solver.
+    if (Number.isNaN(resolved) || !Number.isFinite(resolved) || resolved <= 0) {
+        throw new Error("Invalid distance calculated");
+    }
+
+    return resolved;
 }
 
 module.exports = {

@@ -10,12 +10,37 @@ if (!process.env.ADMIN_API_KEY) {
 
 const cors = require("cors");
 const express = require("express");
+const fs = require("fs");
 const { MongoClient } = require("mongodb");
 const multer = require("multer");
 const path = require("path");
+
+/** Sync trace for /api/analyze — survives container death via ./logs mount. */
+function analyzeTrace(stage, details = {}) {
+    const line = JSON.stringify({
+        ts: new Date().toISOString(),
+        stage,
+        ...details
+    });
+    console.log(`[analyze] ${line}`);
+    const tracePath = process.env.ANALYZE_TRACE_PATH;
+    if (!tracePath) {
+        return;
+    }
+    try {
+        fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+        fs.appendFileSync(tracePath, `${line}\n`, "utf8");
+    } catch (error) {
+        console.error(`[analyze] failed to write trace file: ${error.message}`);
+    }
+}
 const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
 const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
-const { requireFiniteNumber, requireNonEmptyString } = require("./backend/geo/validation");
+const {
+    optionalFiniteNumber,
+    optionalNonEmptyString,
+    requireNonEmptyString
+} = require("./backend/geo/validation");
 const { resolveTriggerDistanceNM } = require("./backend/geo/resolveTriggerDistance");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
@@ -477,19 +502,55 @@ function parseRelationalLogic(rawResponse) {
         );
     }
 
-    // Lateral DME distance OR altitude-based trigger (mutually sufficient).
-    // Missing both rejects with DataIntegrityError → HTTP 422.
+    // Order of operations (do NOT requireFiniteNumber on trigger_distance_nm):
+    //   1. optionalFiniteNumber — null/undefined/""/"null" are valid absences
+    //   2. resolveTriggerDistanceNM — derive NM from altitude when distance absent
+    //   3. assign resolved NM so the existing WGS-84 block can run unchanged
+    // XOR: at least one of distance or altitude must be present (enforced in step 2).
+    const optionalDistance = optionalFiniteNumber(
+        extraction.trigger_distance_nm,
+        "llmExtraction.trigger_distance_nm"
+    );
+    const optionalAltitude = optionalFiniteNumber(
+        extraction.trigger_altitude_msl,
+        "llmExtraction.trigger_altitude_msl"
+    );
+    const optionalGradient = optionalFiniteNumber(
+        extraction.climb_gradient_ft_nm,
+        "llmExtraction.climb_gradient_ft_nm"
+    );
+
+    extraction.trigger_distance_nm = optionalDistance;
+    extraction.trigger_altitude_msl = optionalAltitude;
+    extraction.climb_gradient_ft_nm = optionalGradient;
+
     const triggerDistanceNM = resolveTriggerDistanceNM({
-        triggerDistanceNM: extraction.trigger_distance_nm,
-        triggerAltitudeMsl: extraction.trigger_altitude_msl,
-        climbGradientFtNm: extraction.climb_gradient_ft_nm,
+        triggerDistanceNM: optionalDistance,
+        triggerAltitudeMsl: optionalAltitude,
+        climbGradientFtNm: optionalGradient,
         distanceFieldPath: "llmExtraction.trigger_distance_nm",
         altitudeFieldPath: "llmExtraction.trigger_altitude_msl"
     });
 
-    // Feed the resolved NM back so altitude-only extractions payloads still
-    // carry a finite trigger_distance_nm for the existing 2D WGS-84 block.
     extraction.trigger_distance_nm = triggerDistanceNM;
+
+    // Coerce optional headings (LLMs often emit "360" as a string).
+    const initialMagneticHeading = optionalFiniteNumber(
+        extraction.initial_magnetic_heading,
+        "llmExtraction.initial_magnetic_heading"
+    );
+    const targetMagneticHeading = optionalFiniteNumber(
+        extraction.target_magnetic_heading,
+        "llmExtraction.target_magnetic_heading"
+    );
+    const targetNavaid = optionalNonEmptyString(
+        extraction.target_navaid ?? extraction.target_fix ?? extraction.target_waypoint,
+        "llmExtraction.target_navaid"
+    );
+
+    extraction.initial_magnetic_heading = initialMagneticHeading;
+    extraction.target_magnetic_heading = targetMagneticHeading;
+    extraction.target_navaid = targetNavaid;
 
     const rawDirection = typeof extraction.turn_direction === "string"
         ? extraction.turn_direction.trim().toLowerCase()
@@ -498,12 +559,19 @@ function parseRelationalLogic(rawResponse) {
     let turn = null;
 
     if (rawDirection === "left" || rawDirection === "right") {
+        // Turn is valid with a post-turn heading OR a direct-to navaid/fix.
+        // "Climbing right turn direct CLT" has RIGHT + CLT but no numeric heading.
+        if (targetMagneticHeading === null && targetNavaid === null) {
+            throw new DataIntegrityError(
+                "LLM extraction with turn_direction LEFT/RIGHT must include either " +
+                    "target_magnetic_heading or target_navaid (fix identifier)."
+            );
+        }
+
         turn = {
             turnDirection: rawDirection,
-            magneticHeading: requireFiniteNumber(
-                extraction.target_magnetic_heading,
-                "llmExtraction.target_magnetic_heading"
-            )
+            magneticHeading: targetMagneticHeading,
+            targetNavaid
         };
     } else if (rawDirection !== null && rawDirection !== "none" && rawDirection !== "not_applicable") {
         throw new DataIntegrityError(
@@ -554,10 +622,12 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `Respond with ONLY a single JSON object in exactly this shape:\n` +
         `{"extracted_value": "<the value of ${extractionTarget}>", ` +
         `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
+        `"initial_magnetic_heading": <the initial climb/runway magnetic heading as a number, or null if not stated>, ` +
         `"trigger_distance_nm": <the DME/lateral distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
         `"trigger_altitude_msl": <the altitude in feet MSL that triggers the action as a number, or null if not stated>, ` +
         `"climb_gradient_ft_nm": <the climb gradient in feet per nautical mile if stated as a number, or null if not stated>, ` +
-        `"target_magnetic_heading": <the commanded magnetic heading or course after the action as a number, or null if none>}\n` +
+        `"target_magnetic_heading": <the commanded magnetic heading after the action as a number, or null if none>, ` +
+        `"target_navaid": <the navaid or fix identifier turned direct-to as a string, or null if none>}\n` +
         `TRIGGER RULES:\n` +
         `- If the text states a physical/lateral/DME distance (e.g. "until 3.5 DME"), set trigger_distance_nm to that number.\n` +
         `- If no physical distance is provided but an altitude restriction is stated ` +
@@ -565,19 +635,33 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `and set trigger_distance_nm to null.\n` +
         `- Extract climb_gradient_ft_nm only when the text explicitly states a climb gradient; otherwise null.\n` +
         `- At least one of trigger_distance_nm or trigger_altitude_msl MUST be a number.\n` +
+        `TURN RULES:\n` +
+        `- If turn_direction is LEFT or RIGHT and the text commands a numeric heading after the turn, set target_magnetic_heading.\n` +
+        `- If the text says turn direct to a navaid/fix (e.g. "climbing right turn direct CLT") with no post-turn heading, ` +
+        `set target_navaid to that ident and set target_magnetic_heading to null.\n` +
+        `- When turn_direction is LEFT or RIGHT, at least one of target_magnetic_heading or target_navaid MUST be present.\n` +
+        `Emit numeric fields as JSON numbers when known (not quoted strings).\n` +
         `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
         `Output the raw JSON object and nothing else.`;
 
     // Stage 1: LLM extraction. Infrastructure failure here is a 500 — the
     // inference container is a server-side dependency, not a data problem.
     let rawLlmResponse;
+    analyzeTrace("request_received", {
+        airportId,
+        runwayId,
+        navaidId,
+        extractionTarget,
+        procedureTextChars: procedureText.length
+    });
 
     try {
+        analyzeTrace("llm_request_start");
         const llmResponse = await fetch("http://llm:11434/api/generate", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                model: process.env.LLM_MODEL_NAME || "llama3",
+                model: process.env.LLM_MODEL_NAME || "phi3",
                 prompt,
                 stream: false,
                 format: "json"
@@ -591,13 +675,21 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         }
 
         rawLlmResponse = ((await llmResponse.json()).response || "").trim();
+        analyzeTrace("llm_response_ok", { chars: rawLlmResponse.length });
     } catch (error) {
+        analyzeTrace("llm_failed", { name: error.name, message: error.message });
         console.error(`LLM analyze request failed (${error.name}): ${error.message}`);
         return res.status(500).json({ error: "LLM analysis failed. The inference container did not return a result." });
     }
 
     try {
         const { extraction, triggerDistanceNM, turn } = parseRelationalLogic(rawLlmResponse);
+        analyzeTrace("distance_resolved", {
+            triggerDistanceNM,
+            trigger_altitude_msl: extraction.trigger_altitude_msl,
+            climb_gradient_ft_nm: extraction.climb_gradient_ft_nm,
+            turnDirection: turn?.turnDirection ?? null
+        });
 
         // Stage 3: validated physical ground truth. AIRAC temporal enforcement
         // runs first inside the service; an expired cycle or any missing /
@@ -608,6 +700,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             navaidId.trim(),
             new Date().toISOString()
         );
+        analyzeTrace("ground_truth_ok", { airac: groundTruth.airacCycle?.ident });
 
         const origin = {
             latitude: groundTruth.originRunway.threshold.latitude,
@@ -618,6 +711,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         // Stage 4: deterministic WGS-84 solving. The trigger point is the
         // forward intersection of the departure track with the DME arc around
         // the validated navaid station.
+        analyzeTrace("geo_intersection_start", { triggerDistanceNM, departureTrueHeading });
         const intersection = GeoMath.calculateTrackCircleIntersection(
             origin,
             departureTrueHeading,
@@ -625,13 +719,31 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             triggerDistanceNM
         );
         const triggerPoint = { latitude: intersection.latitude, longitude: intersection.longitude };
+        analyzeTrace("geo_intersection_ok", {
+            distanceAlongTrackNM: intersection.distanceAlongTrackNM,
+            dmeErrorNM: intersection.dmeErrorNM
+        });
 
         let resolvedTurn = null;
 
         if (turn) {
-            // True North normalization: the LLM's magnetic heading is converted
-            // to True using database ground truth before it touches spatial math.
-            const targetTrueHeading = GeoMath.magneticToTrue(turn.magneticHeading, groundTruth.magneticVariation);
+            let targetTrueHeading;
+
+            if (turn.magneticHeading !== null && turn.magneticHeading !== undefined) {
+                // True North normalization: magnetic heading → True via DB variation.
+                targetTrueHeading = GeoMath.magneticToTrue(
+                    turn.magneticHeading,
+                    groundTruth.magneticVariation
+                );
+            } else {
+                // Turn direct to navaid/fix: outbound course is the True bearing
+                // from the computed trigger point to the resolved station.
+                targetTrueHeading = GeoMath.trueBearingBetween(
+                    triggerPoint,
+                    groundTruth.navaid.coordinates
+                );
+            }
+
             const turnEvaluation = GeoMath.getAngularDifference(
                 departureTrueHeading,
                 targetTrueHeading,
@@ -643,8 +755,15 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
                 turnDegrees: turnEvaluation.turnDegrees,
                 turnDirection: turnEvaluation.turnDirection
             };
+            analyzeTrace("turn_resolved", {
+                turnDegrees: resolvedTurn.turnDegrees,
+                turnDirection: resolvedTurn.turnDirection,
+                via: turn.magneticHeading !== null ? "magnetic_heading" : "direct_to_navaid",
+                targetNavaid: turn.targetNavaid
+            });
         }
 
+        analyzeTrace("path_build_start", { turnDegrees: resolvedTurn?.turnDegrees ?? null });
         const path = buildTriggeredTurnPath({
             origin,
             triggerPoint,
@@ -652,6 +771,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             turn: resolvedTurn,
             runway: groundTruth.originRunway.runwayId
         });
+        analyzeTrace("request_complete", { legType: path.parametric?.legType });
 
         return res.json({
             extraction,
@@ -666,9 +786,19 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             disambiguation: groundTruth.disambiguation
         });
     } catch (error) {
+        analyzeTrace("pipeline_failed", { name: error.name, message: error.message });
         // AiracExpiredError subclasses DataIntegrityError: both are structural
         // rejections of the computation, never generic server faults.
         if (error instanceof DataIntegrityError) {
+            return res.status(422).json({ error: error.message });
+        }
+
+        // Circuit-breaker Errors ("Invalid distance calculated", "Infinite loop averted")
+        // are data/geometry faults — surface as 422 with the exact message.
+        if (
+            error instanceof Error &&
+            (error.message === "Invalid distance calculated" || error.message === "Infinite loop averted")
+        ) {
             return res.status(422).json({ error: error.message });
         }
 

@@ -72,7 +72,20 @@ function buildTriggeredTurnPath({ origin, triggerPoint, departureTrueHeading, tu
         const exitRadial = entryRadial + sweepDegrees;
         const rollout = project(center, exitRadial, radiusNM);
 
-        for (let sweep = ARC_SAMPLE_STEP_DEGREES; sweep < Math.abs(sweepDegrees); sweep += ARC_SAMPLE_STEP_DEGREES) {
+        // Circuit breaker: NaN/Infinity/huge sweep would make this loop never terminate.
+        if (Number.isNaN(sweepDegrees) || !Number.isFinite(sweepDegrees)) {
+            throw new Error("Invalid distance calculated");
+        }
+
+        // A turn arc cannot exceed 360° for display sampling; clamp the bound
+        // so a corrupt turnDegrees can never request millions of vertices.
+        const absSweep = Math.min(Math.abs(sweepDegrees), 360);
+        let iterations = 0;
+        for (let sweep = ARC_SAMPLE_STEP_DEGREES; sweep < absSweep; sweep += ARC_SAMPLE_STEP_DEGREES) {
+            iterations++;
+            if (iterations > 10000) {
+                throw new Error("Infinite loop averted");
+            }
             trackCoordinates.push(project(center, entryRadial + turnSign * sweep, radiusNM));
         }
         trackCoordinates.push(rollout);

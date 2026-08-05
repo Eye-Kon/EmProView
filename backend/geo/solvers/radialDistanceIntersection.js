@@ -36,6 +36,16 @@ async function solve(segment, row, context) {
         distanceFieldPath: "segment.spatialTrigger.triggerDistanceNM",
         altitudeFieldPath: "segment.spatialTrigger.triggerAltitudeMsl"
     });
+
+    // Defense in depth: solver must never enter GeoMath with a bad radius.
+    if (
+        Number.isNaN(triggerDistanceNM) ||
+        !Number.isFinite(triggerDistanceNM) ||
+        triggerDistanceNM <= 0
+    ) {
+        throw new Error("Invalid distance calculated");
+    }
+
     spatialTrigger.triggerDistanceNM = triggerDistanceNM;
     const commandedTurn = resolveCommandedTurn(spatialTrigger.resultingAction);
 

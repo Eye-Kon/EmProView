@@ -110,7 +110,12 @@ const GeoMath = {
         const departureBearing = GeoMath.normalizeBearing(trueHeading);
         const radiusNm = Number(triggerDistanceNM);
 
-        if (!Number.isFinite(departureBearing) || !Number.isFinite(radiusNm)) {
+        // Circuit breaker: reject NaN / <=0 / Infinity before any geodetic work.
+        if (Number.isNaN(radiusNm) || !Number.isFinite(radiusNm) || radiusNm <= 0) {
+            throw new Error("Invalid distance calculated");
+        }
+
+        if (!Number.isFinite(departureBearing)) {
             throw new DataIntegrityError("Departure bearing and trigger distance must be finite numbers.");
         }
 
@@ -126,6 +131,14 @@ const GeoMath = {
         let bestForwardIntersection = null;
 
         for (const trackDistanceNm of trackDistancesNm) {
+            if (
+                Number.isNaN(trackDistanceNm) ||
+                !Number.isFinite(trackDistanceNm) ||
+                trackDistanceNm <= 0
+            ) {
+                throw new Error("Invalid distance calculated");
+            }
+
             const candidatePoint = GeoMath.projectAlongTrueHeading(originPoint, trackDistanceNm, departureBearing);
 
             if (!GeoMath.isForwardAlongDepartureBearing(originPoint, candidatePoint, departureBearing)) {
@@ -169,6 +182,18 @@ const GeoMath = {
     projectAlongTrueHeading(originPoint, distanceNm, trueHeading) {
         return turf.destination(originPoint, distanceNm, trueHeading, { units: "nauticalmiles" });
     },
+
+    /**
+     * True-course bearing (degrees) from one WGS-84 point to another.
+     * Used for "turn direct to navaid/fix" when no post-turn magnetic heading is charted.
+     */
+    trueBearingBetween(fromCoords, toCoords) {
+        const fromPoint = turf.point(GeoMath.toLngLat(fromCoords));
+        const toPoint = turf.point(GeoMath.toLngLat(toCoords));
+        return GeoMath.normalizeBearing(turf.bearing(fromPoint, toPoint));
+    },
+
+
 
     isForwardAlongDepartureBearing(originPoint, candidatePoint, departureBearing) {
         const distanceFromOriginNm = turf.distance(originPoint, candidatePoint, { units: "nauticalmiles" });

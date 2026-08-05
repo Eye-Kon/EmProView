@@ -25,10 +25,18 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    # Cap app RAM so a runaway loop OOMs the container instead of the host.
+    mem_limit: 1g
+    memswap_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     environment:
       MONGODB_URI: mongodb://mongo:27017/emproview
       LLM_BASE_URL: http://llm:11434/v1
-      LLM_MODEL_NAME: llama3
+      LLM_MODEL_NAME: phi3
       ENABLE_OCR: "false"
       # Pulled from the .env file next to this compose file; defaults to
       # "false" so production stacks never seed demo procedures by accident.
@@ -39,8 +47,11 @@ services:
       ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in the deployment environment}
       NASR_LOCAL_ZIP_PATH: /app/dropzone/nasr.zip
       BATCH_CONCURRENCY: "1"
+      ANALYZE_TRACE_PATH: /app/logs/analyze-trace.log
     volumes:
       - ./nasr_dropzone:/app/dropzone
+      # Survives container death / host thrash — read logs/analyze-trace.log
+      - ./logs:/app/logs
     depends_on:
       mongo:
         condition: service_healthy
@@ -56,6 +67,13 @@ services:
   mongo:
     image: mongo:latest
     restart: unless-stopped
+    mem_limit: 1g
+    memswap_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     volumes:
       - mongo_data:/data/db
     healthcheck:
@@ -68,6 +86,14 @@ services:
   llm:
     image: ollama/ollama
     restart: unless-stopped
+    # Cap stays at 4g: phi3 fits; llama3 OOM-killed under this budget.
+    mem_limit: 4g
+    memswap_limit: 4g
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     ports:
       - "11434:11434"
     volumes:
@@ -80,7 +106,7 @@ services:
         ollama serve &
         SERVER_PID=$$!
         sleep 5
-        ollama pull llama3
+        ollama pull phi3
         wait $$SERVER_PID
 
 volumes:

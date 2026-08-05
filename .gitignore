@@ -9,3 +9,7 @@ frontend/.env
 # NASR sideload drop zone: operators mount FAA zips here; never commit them.
 nasr_dropzone/*
 !nasr_dropzone/.gitkeep
+
+# Runtime Docker / analyze traces (host-mounted from compose).
+logs/*
+!logs/.gitkeep
