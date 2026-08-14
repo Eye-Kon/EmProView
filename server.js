@@ -475,11 +475,22 @@ function requireAnalyzeAuth(req, res, next) {
     return next();
 }
 
+/** Flat trigger discriminator values the LLM is allowed to emit. */
+const TRIGGER_TYPES = ["altitude", "dme", "unspecified"];
+
 /**
  * Parses the Ollama response into the relational-logic contract. The LLM is
  * an untrusted boundary: its output is treated exactly like external input.
  * Anything that is not strict, complete JSON with coherent turn semantics is
  * a DataIntegrityError (-> 422), never a silent default.
+ *
+ * The trigger schema is deliberately FLAT (no oneOf/anyOf, no nested trigger
+ * object): the 4GiB local model (phi3) reliably fills flat nullable fields
+ * but hallucinates structure on polymorphic/conditional schemas.
+ *   trigger_type             "altitude" | "dme" | "unspecified"
+ *   trigger_altitude_msl     number | null
+ *   trigger_dme_distance_nm  number | null
+ *   trigger_navaid_ident     string | null
  */
 function parseRelationalLogic(rawResponse) {
     // Tolerate a fenced/prefixed reply by isolating the outermost JSON object,
@@ -502,14 +513,16 @@ function parseRelationalLogic(rawResponse) {
         );
     }
 
-    // Order of operations (do NOT requireFiniteNumber on trigger_distance_nm):
-    //   1. optionalFiniteNumber — null/undefined/""/"null" are valid absences
-    //   2. resolveTriggerDistanceNM — derive NM from altitude when distance absent
-    //   3. assign resolved NM so the existing WGS-84 block can run unchanged
-    // XOR: at least one of distance or altitude must be present (enforced in step 2).
-    const optionalDistance = optionalFiniteNumber(
-        extraction.trigger_distance_nm,
-        "llmExtraction.trigger_distance_nm"
+    // Order of operations (do NOT requireFiniteNumber on the trigger fields):
+    //   1. optionalFiniteNumber — null/undefined/""/"null" are valid absences,
+    //      and string outputs ("3.5") are coerced into finite numbers
+    //   2. per-type coherence checks against the flat trigger_type enum
+    //   3. resolveTriggerDistanceNM — derive NM from altitude when distance absent
+    //   4. assign resolved NM so the existing WGS-84 block can run unchanged
+    // trigger_distance_nm is accepted as a legacy alias for trigger_dme_distance_nm.
+    const optionalDmeDistance = optionalFiniteNumber(
+        extraction.trigger_dme_distance_nm ?? extraction.trigger_distance_nm,
+        "llmExtraction.trigger_dme_distance_nm"
     );
     const optionalAltitude = optionalFiniteNumber(
         extraction.trigger_altitude_msl,
@@ -519,19 +532,58 @@ function parseRelationalLogic(rawResponse) {
         extraction.climb_gradient_ft_nm,
         "llmExtraction.climb_gradient_ft_nm"
     );
+    const triggerNavaidIdent = optionalNonEmptyString(
+        extraction.trigger_navaid_ident,
+        "llmExtraction.trigger_navaid_ident"
+    );
 
-    extraction.trigger_distance_nm = optionalDistance;
+    // Flat enum discriminator. When the model omits it, infer from whichever
+    // trigger field it populated rather than rejecting an otherwise-usable
+    // extraction; when the model states it, it must be one of the three values.
+    const rawTriggerType = optionalNonEmptyString(extraction.trigger_type, "llmExtraction.trigger_type");
+    let triggerType = rawTriggerType === null ? null : rawTriggerType.toLowerCase();
+
+    if (triggerType === null) {
+        triggerType = optionalDmeDistance !== null
+            ? "dme"
+            : optionalAltitude !== null ? "altitude" : "unspecified";
+    } else if (!TRIGGER_TYPES.includes(triggerType)) {
+        throw new DataIntegrityError(
+            `LLM extraction returned an incoherent trigger_type: ${extraction.trigger_type}. ` +
+                `Expected 'altitude', 'dme', or 'unspecified'.`
+        );
+    }
+
+    // Per-type coherence. A 'dme' trigger is complete with a null altitude
+    // (and vice versa) — the two fields are independent, never conditional.
+    if (triggerType === "dme" && optionalDmeDistance === null) {
+        throw new DataIntegrityError(
+            "LLM extraction with trigger_type 'dme' must include trigger_dme_distance_nm as a finite number."
+        );
+    }
+
+    if (triggerType === "altitude" && optionalAltitude === null) {
+        throw new DataIntegrityError(
+            "LLM extraction with trigger_type 'altitude' must include trigger_altitude_msl as a finite number."
+        );
+    }
+
+    extraction.trigger_type = triggerType;
+    extraction.trigger_dme_distance_nm = optionalDmeDistance;
     extraction.trigger_altitude_msl = optionalAltitude;
     extraction.climb_gradient_ft_nm = optionalGradient;
+    extraction.trigger_navaid_ident = triggerNavaidIdent;
 
     const triggerDistanceNM = resolveTriggerDistanceNM({
-        triggerDistanceNM: optionalDistance,
+        triggerDistanceNM: optionalDmeDistance,
         triggerAltitudeMsl: optionalAltitude,
         climbGradientFtNm: optionalGradient,
-        distanceFieldPath: "llmExtraction.trigger_distance_nm",
+        distanceFieldPath: "llmExtraction.trigger_dme_distance_nm",
         altitudeFieldPath: "llmExtraction.trigger_altitude_msl"
     });
 
+    // Legacy resolved-distance field: downstream WGS-84 solving and the
+    // response contract still read trigger_distance_nm.
     extraction.trigger_distance_nm = triggerDistanceNM;
 
     // Coerce optional headings (LLMs often emit "360" as a string).
@@ -619,22 +671,27 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `From the procedure text below, extract the relational logic of the procedure, ` +
         `with particular focus on: ${extractionTarget}.\n\n` +
         `PROCEDURE TEXT:\n${procedureText}\n\n` +
-        `Respond with ONLY a single JSON object in exactly this shape:\n` +
+        `Respond with ONLY a single flat JSON object in exactly this shape (every field present, no nesting):\n` +
         `{"extracted_value": "<the value of ${extractionTarget}>", ` +
         `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
         `"initial_magnetic_heading": <the initial climb/runway magnetic heading as a number, or null if not stated>, ` +
-        `"trigger_distance_nm": <the DME/lateral distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
+        `"trigger_type": "<altitude, dme, or unspecified>", ` +
         `"trigger_altitude_msl": <the altitude in feet MSL that triggers the action as a number, or null if not stated>, ` +
+        `"trigger_dme_distance_nm": <the DME distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
+        `"trigger_navaid_ident": <the identifier of the DME station/navaid the distance is measured from as a string, or null if not stated>, ` +
         `"climb_gradient_ft_nm": <the climb gradient in feet per nautical mile if stated as a number, or null if not stated>, ` +
         `"target_magnetic_heading": <the commanded magnetic heading after the action as a number, or null if none>, ` +
         `"target_navaid": <the navaid or fix identifier turned direct-to as a string, or null if none>}\n` +
         `TRIGGER RULES:\n` +
-        `- If the text states a physical/lateral/DME distance (e.g. "until 3.5 DME"), set trigger_distance_nm to that number.\n` +
-        `- If no physical distance is provided but an altitude restriction is stated ` +
-        `(e.g. "Climb to 4500 MSL before turning"), you MUST set trigger_altitude_msl to that altitude ` +
-        `and set trigger_distance_nm to null.\n` +
+        `- If the text states a DME/lateral distance (e.g. "until 3.5 DME" or "at 4 DME CLT"), set trigger_type to "dme", ` +
+        `set trigger_dme_distance_nm to that number, set trigger_navaid_ident to the DME station identifier if one is named ` +
+        `(otherwise null), and set trigger_altitude_msl to null.\n` +
+        `- If no DME distance is provided but an altitude restriction is stated ` +
+        `(e.g. "Climb to 4500 MSL before turning"), set trigger_type to "altitude", set trigger_altitude_msl to that altitude, ` +
+        `and set trigger_dme_distance_nm and trigger_navaid_ident to null.\n` +
+        `- If the text states neither a DME distance nor a trigger altitude, set trigger_type to "unspecified" ` +
+        `and set trigger_altitude_msl, trigger_dme_distance_nm, and trigger_navaid_ident all to null.\n` +
         `- Extract climb_gradient_ft_nm only when the text explicitly states a climb gradient; otherwise null.\n` +
-        `- At least one of trigger_distance_nm or trigger_altitude_msl MUST be a number.\n` +
         `TURN RULES:\n` +
         `- If turn_direction is LEFT or RIGHT and the text commands a numeric heading after the turn, set target_magnetic_heading.\n` +
         `- If the text says turn direct to a navaid/fix (e.g. "climbing right turn direct CLT") with no post-turn heading, ` +
@@ -686,7 +743,10 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         const { extraction, triggerDistanceNM, turn } = parseRelationalLogic(rawLlmResponse);
         analyzeTrace("distance_resolved", {
             triggerDistanceNM,
+            trigger_type: extraction.trigger_type,
+            trigger_dme_distance_nm: extraction.trigger_dme_distance_nm,
             trigger_altitude_msl: extraction.trigger_altitude_msl,
+            trigger_navaid_ident: extraction.trigger_navaid_ident,
             climb_gradient_ft_nm: extraction.climb_gradient_ft_nm,
             turnDirection: turn?.turnDirection ?? null
         });

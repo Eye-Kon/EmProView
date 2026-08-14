@@ -13,8 +13,14 @@ export interface ExtractionResult {
   turn_direction: 'LEFT' | 'RIGHT' | 'NONE'
   /** Initial climb / runway magnetic heading when stated. */
   initial_magnetic_heading?: number | null
+  /** Flat trigger discriminator — the trigger fields below are independent, never conditional. */
+  trigger_type: 'altitude' | 'dme' | 'unspecified'
   /** Resolved lateral trigger distance (charted DME, or derived from altitude). */
   trigger_distance_nm: number
+  /** Charted DME distance in NM when trigger_type is 'dme'; null otherwise. */
+  trigger_dme_distance_nm: number | null
+  /** Ident of the DME station the distance is measured from, when charted. */
+  trigger_navaid_ident: string | null
   /** Altitude trigger in feet MSL when no lateral distance was charted. */
   trigger_altitude_msl?: number | null
   /** Climb gradient ft/NM when stated; engine defaults to 400 if omitted. */
