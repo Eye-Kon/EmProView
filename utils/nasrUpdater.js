@@ -59,6 +59,11 @@ const { getCycleForDate } = require("./airac");
 
 const NAV_DATA_COLLECTION = "nav_data";
 const BATCH_SIZE = 1000;
+
+// Logical multi-tenancy: nav_data colocates proprietary operator overlays
+// (tailored waypoints, e.g. airline EFPs) with this public baseline. Every
+// NASR document is stamped with the public tenant discriminator.
+const PUBLIC_OPERATOR_ID = "FAA";
 const DEFAULT_ZIP_PATH = path.join(__dirname, "..", "nasr_dropzone", "nasr.zip");
 
 // Entry name patterns, in priority order per dataset. Matched against the
@@ -278,6 +283,7 @@ async function streamRunwayEnds(entry, state, collection) {
         batch.push({
             docType: "runway",
             airacCycle: state.cycle.ident,
+            operator_id: PUBLIC_OPERATOR_ID,
             key: `${airport.icao}_${runwayId}`,
             airportId: airport.icao,
             runwayId,
@@ -325,9 +331,9 @@ async function streamNavaids(entry, state, collection) {
 
         batch.push({
             updateOne: {
-                filter: { docType: "navaid", airacCycle: state.cycle.ident, identifier },
+                filter: { docType: "navaid", airacCycle: state.cycle.ident, operator_id: PUBLIC_OPERATOR_ID, identifier },
                 update: {
-                    $setOnInsert: { docType: "navaid", airacCycle: state.cycle.ident, identifier },
+                    $setOnInsert: { docType: "navaid", airacCycle: state.cycle.ident, operator_id: PUBLIC_OPERATOR_ID, identifier },
                     $push: {
                         candidates: {
                             name: text(row.NAME),
@@ -335,6 +341,11 @@ async function streamNavaids(entry, state, collection) {
                             state: text(row.STATE_CODE),
                             latitude,
                             longitude,
+                            // Station elevation in feet MSL. Nullable at ingest
+                            // (some facilities omit ELEV); consumers that need
+                            // it (trigger-navaid resolution) fail-safe at query
+                            // time rather than dropping the whole station here.
+                            elevation: finiteNumber(row.ELEV),
                             magneticVariation
                         }
                     }
@@ -419,8 +430,13 @@ async function ingestNasrZip(db, zipPath = DEFAULT_ZIP_PATH) {
     // Clear residue from a previously interrupted ingestion of this cycle,
     // then stream data docs. The metadata doc is inserted last: queries
     // resolve cycles only through metadata, so until it lands this cycle
-    // is invisible and live reads keep zero-downtime semantics.
-    await collection.deleteMany({ airacCycle: state.cycle.ident });
+    // is invisible and live reads keep zero-downtime semantics. The wipe is
+    // scoped to the public tenant (null matches pre-multi-tenant legacy
+    // docs) so tailored operator overlays for this cycle are never touched.
+    await collection.deleteMany({
+        airacCycle: state.cycle.ident,
+        operator_id: { $in: [PUBLIC_OPERATOR_ID, null] }
+    });
 
     log(`Pass 2/3: streaming ${runwayEndsEntry.path} -> runway docs (insertMany x${BATCH_SIZE}) ...`);
     await streamRunwayEnds(runwayEndsEntry, state, collection);
@@ -429,12 +445,21 @@ async function ingestNasrZip(db, zipPath = DEFAULT_ZIP_PATH) {
     await streamNavaids(navaidsEntry, state, collection);
 
     // Verify the streamed inserts landed completely before committing.
-    const runwayCount = await collection.countDocuments({ docType: "runway", airacCycle: state.cycle.ident });
-    const navaidCount = await collection.countDocuments({ docType: "navaid", airacCycle: state.cycle.ident });
+    // Counts are scoped to the public tenant so colocated tailored operator
+    // documents for the same cycle never skew verification.
+    const runwayCount = await collection.countDocuments({
+        docType: "runway", airacCycle: state.cycle.ident, operator_id: PUBLIC_OPERATOR_ID
+    });
+    const navaidCount = await collection.countDocuments({
+        docType: "navaid", airacCycle: state.cycle.ident, operator_id: PUBLIC_OPERATOR_ID
+    });
 
     if (runwayCount !== state.stats.runways || navaidCount !== state.navaidIdents.size ||
         runwayCount === 0 || navaidCount === 0) {
-        await collection.deleteMany({ airacCycle: state.cycle.ident });
+        await collection.deleteMany({
+            airacCycle: state.cycle.ident,
+            operator_id: { $in: [PUBLIC_OPERATOR_ID, null] }
+        });
         throw new Error(
             `Cycle ${state.cycle.ident} verification failed: runways ${runwayCount}/${state.stats.runways}, ` +
             `navaid idents ${navaidCount}/${state.navaidIdents.size}. Partial insert rolled back.`
@@ -454,6 +479,10 @@ async function ingestNasrZip(db, zipPath = DEFAULT_ZIP_PATH) {
 
     await collection.createIndex({ docType: 1, airacCycle: 1, identifier: 1 });
     await collection.createIndex({ docType: 1, airacCycle: 1, key: 1 });
+    // Multi-tenant lookup path: tailored operator overlays and the public
+    // FAA baseline share nav_data, so the tenant discriminator leads the
+    // compound index. (`identifier` is this collection's ident field.)
+    await collection.createIndex({ operator_id: 1, identifier: 1, airportId: 1 });
 
     log(`SUCCESS: cycle ${state.cycle.ident} committed — ${state.stats.runways} runway ends ` +
         `(${state.stats.runwaysDropped} dropped incomplete), ${state.stats.navaids} navaid records across ` +

@@ -30,6 +30,20 @@ const { requireFiniteNumber, requireNonEmptyString } = require("../backend/geo/v
 
 const NAV_DATA_COLLECTION = "nav_data";
 
+/**
+ * Logical multi-tenancy: proprietary operator procedures (tailored waypoints,
+ * e.g. American Airlines EFPs) coexist with the public FAA NASR baseline in
+ * the single nav_data collection, discriminated by an `operator_id` field.
+ * The public ARINC 424 baseline is operator "FAA". Documents ingested before
+ * the multi-tenant schema carry no operator_id and are treated as FAA public
+ * data (the field is stamped by the ETL going forward).
+ */
+const PUBLIC_OPERATOR_ID = "FAA";
+
+// Compound index backing operator-scoped lookups across millions of colocated
+// tailored + public records. `identifier` is this collection's ident field.
+const OPERATOR_IDENT_AIRPORT_INDEX = { operator_id: 1, identifier: 1, airportId: 1 };
+
 let navDataCollection = null;
 
 /**
@@ -54,6 +68,28 @@ function getCollection() {
     }
 
     return navDataCollection;
+}
+
+/**
+ * Ensures the multi-tenant compound index exists on nav_data. Idempotent
+ * (createIndex is a no-op when the index already exists). server.js awaits
+ * this during startup, right after initNavDb; the NASR ETL also builds it at
+ * ingest commit time.
+ */
+async function ensureNavDataIndexes() {
+    await getCollection().createIndex(OPERATOR_IDENT_AIRPORT_INDEX);
+}
+
+/**
+ * Tenant filter for nav_data queries. Tailored operators match strictly;
+ * the FAA public baseline also matches documents with no operator_id stamp
+ * (legacy cycles ingested before the multi-tenant schema — in MongoDB,
+ * `null` inside $in matches missing fields).
+ */
+function operatorFilter(operatorId) {
+    return operatorId === PUBLIC_OPERATOR_ID
+        ? { operator_id: { $in: [PUBLIC_OPERATOR_ID, null] } }
+        : { operator_id: operatorId };
 }
 
 function normalizeFlightDate(flightDate) {
@@ -203,6 +239,185 @@ async function getNavaid(identifier, referencePoint, flightDate = new Date()) {
 }
 
 /**
+ * Trigger-navaid resolution constants.
+ *
+ * NAV_BASE.csv carries no airport association, so "terminal facility
+ * associated with the airport" is implemented as a deterministic spatial
+ * proxy: a terminal-type station (DME/TACAN — the DME/ILS class of
+ * facilities present in NAV_BASE) sited within TERMINAL_RADIUS_NM of the
+ * airport's reference coordinates. Enroute stations (VOR/VOR-DME/VORTAC/
+ * NDB/...) are only eligible via the fallback radius.
+ */
+const TERMINAL_NAVAID_TYPES = new Set(["DME", "TACAN"]);
+const TERMINAL_RADIUS_NM = 5;
+const ENROUTE_FALLBACK_RADIUS_NM = 40;
+
+/**
+ * Runs the bounded spatial search for one operator's dataset:
+ *
+ *   Tier 1 (terminal):  candidates of a terminal type (DME/TACAN) within
+ *                       TERMINAL_RADIUS_NM of the airport reference point.
+ *                       Nearest wins.
+ *   Tier 2 (enroute):   only if tier 1 is empty — candidates of enroute
+ *                       types within ENROUTE_FALLBACK_RADIUS_NM of the
+ *                       airport reference point. Nearest wins.
+ *
+ * Returns null when the ident is absent from this operator's dataset or no
+ * candidate satisfies the radius rules — null is the cascade signal for the
+ * caller, never a silent guess. A same-ident station outside these bounds
+ * is the wrong facility, not a fallback.
+ */
+async function searchOperatorDataset(navaidId, cycleIdent, operatorId, airportReference) {
+    const document = await getCollection().findOne({
+        docType: "navaid",
+        identifier: navaidId,
+        airacCycle: cycleIdent,
+        ...operatorFilter(operatorId)
+    });
+    const candidates = Array.isArray(document?.candidates) ? document.candidates : [];
+
+    if (candidates.length === 0) {
+        return { candidateCount: 0, match: null };
+    }
+
+    const ranked = candidates
+        .filter((candidate) => Number.isFinite(candidate.latitude) && Number.isFinite(candidate.longitude))
+        .map((candidate) => ({
+            candidate,
+            distanceNM: greatCircleDistanceNM(airportReference, candidate)
+        }))
+        .sort((a, b) => a.distanceNM - b.distanceNM);
+
+    const terminalMatch = ranked.find(
+        (entry) => TERMINAL_NAVAID_TYPES.has(entry.candidate.type) && entry.distanceNM <= TERMINAL_RADIUS_NM
+    );
+    const enrouteMatch = terminalMatch
+        ? null
+        : ranked.find(
+            (entry) => !TERMINAL_NAVAID_TYPES.has(entry.candidate.type) && entry.distanceNM <= ENROUTE_FALLBACK_RADIUS_NM
+        );
+    const selected = terminalMatch ?? enrouteMatch;
+
+    if (!selected) {
+        return { candidateCount: candidates.length, match: null };
+    }
+
+    return {
+        candidateCount: candidates.length,
+        match: {
+            selected,
+            tier: terminalMatch ? "terminal" : "enroute_40nm",
+            candidateCount: candidates.length
+        }
+    };
+}
+
+/**
+ * Resolves an LLM-extracted trigger navaid ident (the station a charted DME
+ * distance is measured from) to exactly one validated station, scoped to
+ * the airport of the procedure, via a hierarchical multi-tenant cascade:
+ *
+ *   Step A (tailored):  the requested operator's dataset (operator_id ===
+ *                       requestedOperator) is searched first with the
+ *                       terminal/enroute radius rules above. When the
+ *                       request is not operator-tailored (operator "FAA"),
+ *                       this IS the public baseline query and Step B is
+ *                       skipped.
+ *   Step B (public):    only if Step A resolves nothing — the exact same
+ *                       spatial query hardcoded to the public FAA dataset
+ *                       (operator_id === "FAA").
+ *   Otherwise:          DataIntegrityError (-> 422). Null coordinates are
+ *                       never returned.
+ *
+ * The returned station carries exact WGS-84 latitude/longitude and MSL
+ * elevation; a missing/non-finite physical field on the selected station
+ * throws with the exact database field path. Selection metadata records
+ * which dataset (tailored vs public) resolved the station.
+ *
+ * @param {string} identifier - trigger navaid ident from the LLM, e.g. "CLT"
+ * @param {{airportId:string,latitude:number,longitude:number}} airportReference
+ *   airport identity + reference coordinates (the procedure's validated
+ *   runway threshold serves as the airport reference point)
+ * @param {Date|string|number} [flightDate] - defaults to current UTC time
+ * @param {string} [operatorId] - tenant discriminator, e.g. "AAL"; defaults
+ *   to the public FAA baseline
+ */
+async function resolveTriggerNavaid(identifier, airportReference, flightDate = new Date(), operatorId = PUBLIC_OPERATOR_ID) {
+    const activeCycle = await determineActiveCycle(flightDate);
+
+    const navaidId = requireNonEmptyString(identifier, "trigger navaid identifier").toUpperCase();
+    const requestedOperator = requireNonEmptyString(operatorId, "operator_id").toUpperCase();
+    const airportId = requireNonEmptyString(airportReference?.airportId, "airportReference.airportId");
+
+    if (!Number.isFinite(airportReference?.latitude) || !Number.isFinite(airportReference?.longitude)) {
+        throw new DataIntegrityError(
+            `Trigger navaid ${navaidId} could not be resolved: airport reference coordinates for ${airportId} are not finite.`
+        );
+    }
+
+    // Step A (tailored): the requested operator's dataset.
+    let resolvedOperator = requestedOperator;
+    let { candidateCount, match } = await searchOperatorDataset(
+        navaidId, activeCycle.ident, requestedOperator, airportReference
+    );
+
+    // Step B (public fallback): same spatial query, hardcoded to the FAA
+    // public baseline. Skipped when Step A already searched it.
+    if (!match && requestedOperator !== PUBLIC_OPERATOR_ID) {
+        resolvedOperator = PUBLIC_OPERATOR_ID;
+        const publicResult = await searchOperatorDataset(
+            navaidId, activeCycle.ident, PUBLIC_OPERATOR_ID, airportReference
+        );
+        candidateCount += publicResult.candidateCount;
+        match = publicResult.match;
+    }
+
+    // Strict rejection: both the tailored and public datasets failed.
+    if (!match) {
+        const searchedDatasets = requestedOperator === PUBLIC_OPERATOR_ID
+            ? `the public ${PUBLIC_OPERATOR_ID} dataset`
+            : `the tailored ${requestedOperator} dataset and the public ${PUBLIC_OPERATOR_ID} fallback`;
+
+        if (candidateCount === 0) {
+            throw new DataIntegrityError(
+                `Trigger navaid could not be resolved: ident ${navaidId} not found in AIRAC cycle ${activeCycle.ident} ` +
+                    `(searched ${searchedDatasets}).`
+            );
+        }
+
+        throw new DataIntegrityError(
+            `Trigger navaid ${navaidId} could not be resolved for ${airportId}: ` +
+                `${candidateCount} candidate station(s) exist in AIRAC cycle ${activeCycle.ident} across ${searchedDatasets}, ` +
+                `but none is a terminal facility (DME/TACAN) within ${TERMINAL_RADIUS_NM} NM of the airport or an ` +
+                `enroute facility within ${ENROUTE_FALLBACK_RADIUS_NM} NM.`
+        );
+    }
+
+    const { selected, tier } = match;
+    const fieldPath = `nav_data[${activeCycle.ident}].navaids.${navaidId}`;
+
+    return {
+        identifier: navaidId,
+        name: selected.candidate.name,
+        type: selected.candidate.type,
+        state: selected.candidate.state ?? null,
+        operator_id: resolvedOperator,
+        latitude: requireFiniteNumber(selected.candidate.latitude, `${fieldPath}.latitude`),
+        longitude: requireFiniteNumber(selected.candidate.longitude, `${fieldPath}.longitude`),
+        elevationFtMsl: requireFiniteNumber(selected.candidate.elevation, `${fieldPath}.elevation`),
+        magneticVariation: requireFiniteNumber(selected.candidate.magneticVariation, `${fieldPath}.magneticVariation`),
+        airacCycle: activeCycle.ident,
+        selection: {
+            tier,
+            distanceNM: Number(selected.distanceNM.toFixed(2)),
+            candidateCount: match.candidateCount,
+            operator: resolvedOperator,
+            dataset: resolvedOperator === PUBLIC_OPERATOR_ID ? "public" : "tailored"
+        }
+    };
+}
+
+/**
  * Resolves a runway end using the ground truth of the AIRAC cycle effective
  * on the flight date.
  *
@@ -241,7 +456,12 @@ async function getRunway(airportCode, runwayIdentifier, flightDate = new Date())
 
 module.exports = {
     initNavDb,
+    ensureNavDataIndexes,
     getNavaid,
     getRunway,
-    determineActiveCycle
+    resolveTriggerNavaid,
+    determineActiveCycle,
+    TERMINAL_RADIUS_NM,
+    ENROUTE_FALLBACK_RADIUS_NM,
+    PUBLIC_OPERATOR_ID
 };

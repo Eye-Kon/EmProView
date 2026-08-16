@@ -51,6 +51,22 @@ function optionalFiniteNumber(value, fieldPath) {
     throw new DataIntegrityError(`Field ${fieldPath} must be a finite number, null, or omitted.`);
 }
 
+/**
+ * Strict enum gate for LLM payloads. No coercion, no trimming, no case
+ * normalization, no inference from other fields: the value must be a string
+ * strictly equal to one of the allowed values, or the payload is rejected.
+ */
+function requireEnum(value, allowedValues, fieldPath) {
+    if (typeof value !== "string" || !allowedValues.includes(value)) {
+        throw new DataIntegrityError(
+            `Field ${fieldPath} must be exactly one of: ${allowedValues.map((v) => `'${v}'`).join(", ")}. ` +
+                `Received: ${JSON.stringify(value) ?? "undefined"}.`
+        );
+    }
+
+    return value;
+}
+
 function requireNonEmptyString(value, fieldPath) {
     if (typeof value !== "string" || value.trim() === "") {
         throw new DataIntegrityError(`Field ${fieldPath} must be a non-empty string.`);
@@ -86,6 +102,7 @@ module.exports = {
     requireField,
     requireFiniteNumber,
     optionalFiniteNumber,
+    requireEnum,
     requireNonEmptyString,
     optionalNonEmptyString
 };

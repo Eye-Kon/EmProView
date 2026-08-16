@@ -6,6 +6,13 @@ export interface AnalyzeRequest {
   airportId: string
   runwayId: string
   navaidId: string
+  /**
+   * Optional tenant discriminator for tailored procedures (e.g. "AAL").
+   * Trigger-navaid resolution searches that operator's proprietary dataset
+   * first, then falls back to the public FAA baseline. Omitted defaults to
+   * "FAA" (the public ARINC 424 baseline).
+   */
+  operator_id?: string
 }
 
 export interface ExtractionResult {
@@ -38,6 +45,32 @@ export interface TriggerPoint {
   dmeErrorNM: number
 }
 
+/** Resolved station the charted DME distance is measured from. */
+export interface TriggerNavaid {
+  identifier: string
+  name: string | null
+  type: string | null
+  state: string | null
+  /** Tenant that resolved the station ("FAA" public, or e.g. "AAL" tailored). */
+  operator_id: string
+  coordinates: {
+    latitude: number
+    longitude: number
+  }
+  elevationFtMsl: number
+  magneticVariation: number
+  selection: {
+    tier: 'terminal' | 'enroute_40nm'
+    distanceNM: number
+    candidateCount: number
+    /** Operator whose dataset the station came from. */
+    operator: string
+    /** Whether the tailored dataset or the public FAA fallback resolved it. */
+    dataset: 'tailored' | 'public'
+    note: string
+  }
+}
+
 export interface AiracCycle {
   ident: string
   effectiveFrom: string
@@ -55,6 +88,8 @@ export interface Disambiguation {
 export interface AnalyzeResponse {
   extraction: ExtractionResult
   airacCycle: AiracCycle
+  /** Present when the LLM extracted a trigger_navaid_ident; null otherwise. */
+  triggerNavaid: TriggerNavaid | null
   triggerPoint: TriggerPoint
   parametric: Record<string, unknown>
   geojson: FeatureCollection

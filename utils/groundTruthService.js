@@ -54,12 +54,22 @@ function initGroundTruthService(db) {
  * @param {string} runwayId - runway end identifier, e.g. "16L"
  * @param {string} navaidId - navaid ident, e.g. "TCH"
  * @param {Date|string|number} [currentUtcTime] - defaults to current UTC time
+ * @param {object} [options]
+ * @param {string|null} [options.triggerNavaidIdent] - LLM-extracted ident of
+ *   the station a charted DME distance is measured from. When present it is
+ *   resolved via the strict tiered lookup (terminal facilities at the
+ *   airport first, then enroute within 40 NM) and attached as
+ *   `triggerNavaid`; an unresolvable ident throws DataIntegrityError.
+ * @param {string} [options.operatorId] - tenant discriminator for tailored
+ *   procedures (e.g. "AAL"). The trigger navaid is resolved against that
+ *   operator's dataset first, falling back to the public FAA baseline;
+ *   omitted means public-only.
  * @returns {Promise<object>} validated ground-truth contract (see below)
  * @throws {AiracExpiredError} when no loaded AIRAC cycle covers currentUtcTime
  * @throws {DataIntegrityError} when a record is missing or a physical field
  *   is absent / non-finite; the message names the exact database field
  */
-async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, currentUtcTime = new Date()) {
+async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, currentUtcTime = new Date(), options = {}) {
     // 1. Temporal enforcement. determineActiveCycle throws AiracExpiredError
     //    before any spatial query is issued; the covering cycle it returns
     //    scopes both queries below to the same ground-truth snapshot.
@@ -78,6 +88,51 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
         { latitude: runway.latitude, longitude: runway.longitude },
         currentUtcTime
     );
+
+    // 4. Optional trigger navaid (the station the charted DME distance is
+    //    measured from), resolved via the strict tiered lookup with the
+    //    runway threshold serving as the airport reference point. Failure
+    //    here is a hard 422 — never null coordinates into the math engine.
+    let triggerNavaid = null;
+
+    if (options.triggerNavaidIdent) {
+        const resolved = await navDb.resolveTriggerNavaid(
+            options.triggerNavaidIdent,
+            {
+                airportId: runway.airportCode,
+                latitude: runway.latitude,
+                longitude: runway.longitude
+            },
+            currentUtcTime,
+            options.operatorId
+        );
+
+        triggerNavaid = {
+            identifier: resolved.identifier,
+            name: resolved.name,
+            type: resolved.type,
+            state: resolved.state,
+            operator_id: resolved.operator_id,
+            coordinates: {
+                latitude: resolved.latitude,
+                longitude: resolved.longitude
+            },
+            elevationFtMsl: resolved.elevationFtMsl,
+            magneticVariation: resolved.magneticVariation,
+            selection: {
+                ...resolved.selection,
+                note:
+                    `Trigger navaid ${resolved.identifier} resolved via ` +
+                    `${resolved.selection.tier === "terminal" ? "terminal facility filter" : "40 NM enroute fallback"} ` +
+                    `from the ${resolved.selection.dataset === "tailored"
+                        ? `tailored ${resolved.selection.operator} dataset`
+                        : "public FAA dataset"} ` +
+                    `as ${resolved.name} (${resolved.type}) at ${resolved.selection.distanceNM} NM from the ` +
+                    `${runway.airportCode} ${runway.runwayIdentifier} reference point ` +
+                    `(${resolved.selection.candidateCount} candidate station(s) shared this ident).`
+            }
+        };
+    }
 
     const disambiguation = navaid.disambiguation
         ? {
@@ -121,6 +176,7 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
         // The variation relevant to procedure geometry at the origin: courses
         // published magnetically at the airport convert to True with this value.
         magneticVariation: runway.magneticVariation,
+        triggerNavaid,
         disambiguation
     };
 }

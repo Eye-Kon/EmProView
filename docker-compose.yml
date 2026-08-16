@@ -87,8 +87,27 @@ services:
     image: ollama/ollama
     restart: unless-stopped
     # Cap stays at 4g: phi3 fits; llama3 OOM-killed under this budget.
+    # (Model weights live in GPU VRAM once the NVIDIA reservation below is
+    # active, so this cap only bounds the host-side process memory.)
     mem_limit: 4g
     memswap_limit: 4g
+    # GPU passthrough: reserve one NVIDIA GPU so inference runs on hardware
+    # instead of CPU (fixes the llama-server EOF crashes and slow evals).
+    # Requires the NVIDIA container runtime on the Docker host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      # Keep the model resident between requests: cold-loading weights per
+      # request is where most extraction latency (and flakiness) came from.
+      - OLLAMA_KEEP_ALIVE=24h
+      # Single-request serving matches the app's one-at-a-time extraction
+      # pipeline and avoids VRAM contention from parallel slots.
+      - OLLAMA_NUM_PARALLEL=1
     logging:
       driver: json-file
       options:

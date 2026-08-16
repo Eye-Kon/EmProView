@@ -36,12 +36,7 @@ function analyzeTrace(stage, details = {}) {
 }
 const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
 const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
-const {
-    optionalFiniteNumber,
-    optionalNonEmptyString,
-    requireNonEmptyString
-} = require("./backend/geo/validation");
-const { resolveTriggerDistanceNM } = require("./backend/geo/resolveTriggerDistance");
+const { parseRelationalLogic } = require("./backend/extraction/parseRelationalLogic");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
 const { createBatchJob, initBatchWorker, JOBS_COLLECTION, RESULTS_COLLECTION } = require("./backend/jobs/batchProcessor");
@@ -53,7 +48,7 @@ const {
     getProcedureAirportCode,
     enrichProcedureWithSpatialTriggers
 } = require("./backend/extractionService");
-const { initNavDb, determineActiveCycle } = require("./utils/navDbQuery");
+const { initNavDb, ensureNavDataIndexes, determineActiveCycle, PUBLIC_OPERATOR_ID } = require("./utils/navDbQuery");
 const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExporter");
 
 const app = express();
@@ -62,6 +57,14 @@ const PORT = process.env.PORT || 3000;
 // OCR requires a vision-capable model; air-gapped deployments with a
 // text-only local LLM must disable it explicitly (default: disabled).
 const OCR_ENABLED = process.env.ENABLE_OCR === "true";
+
+// Deterministic extraction settings for the native Ollama caller: zero
+// temperature removes sampling randomness, and the fixed 4096-token context
+// window guarantees the full prompt + procedure text is never silently
+// truncated. Bounded retries absorb the residual failure mode of a small
+// local model emitting malformed or schema-violating JSON.
+const LLM_EXTRACTION_OPTIONS = { num_ctx: 4096, temperature: 0.0 };
+const LLM_EXTRACTION_MAX_ATTEMPTS = 3;
 
 // VULNERABILITY #3 PATCH: The Memory Bomb
 // Enforce strict 5MB limit and reject non-image MIME types
@@ -108,6 +111,9 @@ async function connectDB() {
     const initSteps = [
         // Point the geodetic ground-truth layer at live nav_data
         ["initNavDb (geodetic ground-truth layer)", () => initNavDb(db)],
+        // Multi-tenant compound index ({operator_id, identifier, airportId})
+        // must exist before operator-scoped queries serve traffic.
+        ["ensureNavDataIndexes (nav_data multi-tenant index)", () => ensureNavDataIndexes()],
         // Demo seeding is a development convenience only: production
         // containers must start with an empty procedures collection.
         ["seedDatabase (demo data seeder)", async () => {
@@ -475,165 +481,6 @@ function requireAnalyzeAuth(req, res, next) {
     return next();
 }
 
-/** Flat trigger discriminator values the LLM is allowed to emit. */
-const TRIGGER_TYPES = ["altitude", "dme", "unspecified"];
-
-/**
- * Parses the Ollama response into the relational-logic contract. The LLM is
- * an untrusted boundary: its output is treated exactly like external input.
- * Anything that is not strict, complete JSON with coherent turn semantics is
- * a DataIntegrityError (-> 422), never a silent default.
- *
- * The trigger schema is deliberately FLAT (no oneOf/anyOf, no nested trigger
- * object): the 4GiB local model (phi3) reliably fills flat nullable fields
- * but hallucinates structure on polymorphic/conditional schemas.
- *   trigger_type             "altitude" | "dme" | "unspecified"
- *   trigger_altitude_msl     number | null
- *   trigger_dme_distance_nm  number | null
- *   trigger_navaid_ident     string | null
- */
-function parseRelationalLogic(rawResponse) {
-    // Tolerate a fenced/prefixed reply by isolating the outermost JSON object,
-    // but nothing beyond that: the content itself must parse strictly.
-    const jsonMatch = typeof rawResponse === "string" ? rawResponse.match(/\{[\s\S]*\}/) : null;
-
-    if (!jsonMatch) {
-        throw new DataIntegrityError(
-            `LLM extraction did not produce a JSON object of relational logic. Raw response: ${String(rawResponse).slice(0, 200)}`
-        );
-    }
-
-    let extraction;
-
-    try {
-        extraction = JSON.parse(jsonMatch[0]);
-    } catch {
-        throw new DataIntegrityError(
-            `LLM extraction produced malformed JSON. Raw response: ${jsonMatch[0].slice(0, 200)}`
-        );
-    }
-
-    // Order of operations (do NOT requireFiniteNumber on the trigger fields):
-    //   1. optionalFiniteNumber — null/undefined/""/"null" are valid absences,
-    //      and string outputs ("3.5") are coerced into finite numbers
-    //   2. per-type coherence checks against the flat trigger_type enum
-    //   3. resolveTriggerDistanceNM — derive NM from altitude when distance absent
-    //   4. assign resolved NM so the existing WGS-84 block can run unchanged
-    // trigger_distance_nm is accepted as a legacy alias for trigger_dme_distance_nm.
-    const optionalDmeDistance = optionalFiniteNumber(
-        extraction.trigger_dme_distance_nm ?? extraction.trigger_distance_nm,
-        "llmExtraction.trigger_dme_distance_nm"
-    );
-    const optionalAltitude = optionalFiniteNumber(
-        extraction.trigger_altitude_msl,
-        "llmExtraction.trigger_altitude_msl"
-    );
-    const optionalGradient = optionalFiniteNumber(
-        extraction.climb_gradient_ft_nm,
-        "llmExtraction.climb_gradient_ft_nm"
-    );
-    const triggerNavaidIdent = optionalNonEmptyString(
-        extraction.trigger_navaid_ident,
-        "llmExtraction.trigger_navaid_ident"
-    );
-
-    // Flat enum discriminator. When the model omits it, infer from whichever
-    // trigger field it populated rather than rejecting an otherwise-usable
-    // extraction; when the model states it, it must be one of the three values.
-    const rawTriggerType = optionalNonEmptyString(extraction.trigger_type, "llmExtraction.trigger_type");
-    let triggerType = rawTriggerType === null ? null : rawTriggerType.toLowerCase();
-
-    if (triggerType === null) {
-        triggerType = optionalDmeDistance !== null
-            ? "dme"
-            : optionalAltitude !== null ? "altitude" : "unspecified";
-    } else if (!TRIGGER_TYPES.includes(triggerType)) {
-        throw new DataIntegrityError(
-            `LLM extraction returned an incoherent trigger_type: ${extraction.trigger_type}. ` +
-                `Expected 'altitude', 'dme', or 'unspecified'.`
-        );
-    }
-
-    // Per-type coherence. A 'dme' trigger is complete with a null altitude
-    // (and vice versa) — the two fields are independent, never conditional.
-    if (triggerType === "dme" && optionalDmeDistance === null) {
-        throw new DataIntegrityError(
-            "LLM extraction with trigger_type 'dme' must include trigger_dme_distance_nm as a finite number."
-        );
-    }
-
-    if (triggerType === "altitude" && optionalAltitude === null) {
-        throw new DataIntegrityError(
-            "LLM extraction with trigger_type 'altitude' must include trigger_altitude_msl as a finite number."
-        );
-    }
-
-    extraction.trigger_type = triggerType;
-    extraction.trigger_dme_distance_nm = optionalDmeDistance;
-    extraction.trigger_altitude_msl = optionalAltitude;
-    extraction.climb_gradient_ft_nm = optionalGradient;
-    extraction.trigger_navaid_ident = triggerNavaidIdent;
-
-    const triggerDistanceNM = resolveTriggerDistanceNM({
-        triggerDistanceNM: optionalDmeDistance,
-        triggerAltitudeMsl: optionalAltitude,
-        climbGradientFtNm: optionalGradient,
-        distanceFieldPath: "llmExtraction.trigger_dme_distance_nm",
-        altitudeFieldPath: "llmExtraction.trigger_altitude_msl"
-    });
-
-    // Legacy resolved-distance field: downstream WGS-84 solving and the
-    // response contract still read trigger_distance_nm.
-    extraction.trigger_distance_nm = triggerDistanceNM;
-
-    // Coerce optional headings (LLMs often emit "360" as a string).
-    const initialMagneticHeading = optionalFiniteNumber(
-        extraction.initial_magnetic_heading,
-        "llmExtraction.initial_magnetic_heading"
-    );
-    const targetMagneticHeading = optionalFiniteNumber(
-        extraction.target_magnetic_heading,
-        "llmExtraction.target_magnetic_heading"
-    );
-    const targetNavaid = optionalNonEmptyString(
-        extraction.target_navaid ?? extraction.target_fix ?? extraction.target_waypoint,
-        "llmExtraction.target_navaid"
-    );
-
-    extraction.initial_magnetic_heading = initialMagneticHeading;
-    extraction.target_magnetic_heading = targetMagneticHeading;
-    extraction.target_navaid = targetNavaid;
-
-    const rawDirection = typeof extraction.turn_direction === "string"
-        ? extraction.turn_direction.trim().toLowerCase()
-        : null;
-
-    let turn = null;
-
-    if (rawDirection === "left" || rawDirection === "right") {
-        // Turn is valid with a post-turn heading OR a direct-to navaid/fix.
-        // "Climbing right turn direct CLT" has RIGHT + CLT but no numeric heading.
-        if (targetMagneticHeading === null && targetNavaid === null) {
-            throw new DataIntegrityError(
-                "LLM extraction with turn_direction LEFT/RIGHT must include either " +
-                    "target_magnetic_heading or target_navaid (fix identifier)."
-            );
-        }
-
-        turn = {
-            turnDirection: rawDirection,
-            magneticHeading: targetMagneticHeading,
-            targetNavaid
-        };
-    } else if (rawDirection !== null && rawDirection !== "none" && rawDirection !== "not_applicable") {
-        throw new DataIntegrityError(
-            `LLM extraction returned an incoherent turn_direction: ${extraction.turn_direction}. Expected LEFT, RIGHT, or NONE.`
-        );
-    }
-
-    return { extraction, triggerDistanceNM, turn };
-}
-
 // Bridges the extraction, ground-truth, and spatial calculation layers:
 //   Stage 1  LLM extraction of relational logic (local Ollama container,
 //            native /api/generate via the Docker service name http://llm:11434).
@@ -648,7 +495,8 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         extraction_target: extractionTarget,
         airportId,
         runwayId,
-        navaidId
+        navaidId,
+        operator_id: rawOperatorId
     } = req.body || {};
 
     const missing = [
@@ -666,6 +514,20 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         });
     }
 
+    // Logical multi-tenancy: an optional operator_id (e.g. "AAL") scopes
+    // trigger-navaid resolution to that operator's tailored dataset, with a
+    // public-FAA fallback. Omitted/null defaults to the public ARINC 424
+    // baseline ("FAA"); a present-but-invalid value is a 400, never a guess.
+    if (rawOperatorId !== undefined && rawOperatorId !== null &&
+        (typeof rawOperatorId !== "string" || rawOperatorId.trim() === "")) {
+        return res.status(400).json({
+            error: `Invalid field: operator_id must be a non-empty string (e.g. "AAL") when provided. ` +
+                `Omit it to query the public ${PUBLIC_OPERATOR_ID} dataset.`
+        });
+    }
+
+    const operatorId = (rawOperatorId ?? PUBLIC_OPERATOR_ID).trim().toUpperCase();
+
     const prompt =
         `You are a precision aviation data extraction tool.\n` +
         `From the procedure text below, extract the relational logic of the procedure, ` +
@@ -675,7 +537,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `{"extracted_value": "<the value of ${extractionTarget}>", ` +
         `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
         `"initial_magnetic_heading": <the initial climb/runway magnetic heading as a number, or null if not stated>, ` +
-        `"trigger_type": "<altitude, dme, or unspecified>", ` +
+        `"trigger_type": "<REQUIRED: exactly one of altitude, dme, or unspecified — lowercase, never null>", ` +
         `"trigger_altitude_msl": <the altitude in feet MSL that triggers the action as a number, or null if not stated>, ` +
         `"trigger_dme_distance_nm": <the DME distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
         `"trigger_navaid_ident": <the identifier of the DME station/navaid the distance is measured from as a string, or null if not stated>, ` +
@@ -692,6 +554,9 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `- If the text states neither a DME distance nor a trigger altitude, set trigger_type to "unspecified" ` +
         `and set trigger_altitude_msl, trigger_dme_distance_nm, and trigger_navaid_ident all to null.\n` +
         `- Extract climb_gradient_ft_nm only when the text explicitly states a climb gradient; otherwise null.\n` +
+        `- trigger_type is MANDATORY and must be exactly "altitude", "dme", or "unspecified" in lowercase. ` +
+        `Never omit it, never set it to null, never use any other value.\n` +
+        `- NEVER output a field named "trigger_distance_nm". The only distance field in this schema is trigger_dme_distance_nm.\n` +
         `TURN RULES:\n` +
         `- If turn_direction is LEFT or RIGHT and the text commands a numeric heading after the turn, set target_magnetic_heading.\n` +
         `- If the text says turn direct to a navaid/fix (e.g. "climbing right turn direct CLT") with no post-turn heading, ` +
@@ -701,46 +566,81 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
         `Output the raw JSON object and nothing else.`;
 
-    // Stage 1: LLM extraction. Infrastructure failure here is a 500 — the
-    // inference container is a server-side dependency, not a data problem.
-    let rawLlmResponse;
     analyzeTrace("request_received", {
         airportId,
         runwayId,
         navaidId,
+        operatorId,
         extractionTarget,
         procedureTextChars: procedureText.length
     });
 
     try {
-        analyzeTrace("llm_request_start");
-        const llmResponse = await fetch("http://llm:11434/api/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: process.env.LLM_MODEL_NAME || "phi3",
-                prompt,
-                stream: false,
-                format: "json"
-            }),
-            // Local CPU inference can be slow; abort rather than hang forever.
-            signal: AbortSignal.timeout(120_000)
-        });
+        // Stage 1: LLM extraction with a bounded retry loop. Each attempt is
+        // a full round trip: Ollama call (format: "json", deterministic
+        // options), then strict schema validation via parseRelationalLogic.
+        // Malformed JSON or a schema violation (DataIntegrityError) retries
+        // up to LLM_EXTRACTION_MAX_ATTEMPTS; infrastructure failure (the
+        // inference container unreachable / HTTP error / timeout) is still
+        // an immediate 500 — retrying cannot fix a downed dependency.
+        let parsedExtraction = null;
+        let lastExtractionError = null;
 
-        if (!llmResponse.ok) {
-            throw new Error(`Ollama returned HTTP ${llmResponse.status} ${llmResponse.statusText}`);
+        for (let attempt = 1; attempt <= LLM_EXTRACTION_MAX_ATTEMPTS; attempt += 1) {
+            let rawLlmResponse;
+
+            try {
+                analyzeTrace("llm_request_start", { attempt });
+                const llmResponse = await fetch("http://llm:11434/api/generate", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        model: process.env.LLM_MODEL_NAME || "phi3",
+                        prompt,
+                        stream: false,
+                        format: "json",
+                        options: LLM_EXTRACTION_OPTIONS
+                    }),
+                    // Local inference can be slow; abort rather than hang forever.
+                    signal: AbortSignal.timeout(120_000)
+                });
+
+                if (!llmResponse.ok) {
+                    throw new Error(`Ollama returned HTTP ${llmResponse.status} ${llmResponse.statusText}`);
+                }
+
+                rawLlmResponse = ((await llmResponse.json()).response || "").trim();
+                analyzeTrace("llm_response_ok", { attempt, chars: rawLlmResponse.length });
+            } catch (error) {
+                analyzeTrace("llm_failed", { attempt, name: error.name, message: error.message });
+                console.error(`LLM analyze request failed (${error.name}): ${error.message}`);
+                return res.status(500).json({ error: "LLM analysis failed. The inference container did not return a result." });
+            }
+
+            try {
+                parsedExtraction = parseRelationalLogic(rawLlmResponse);
+                break;
+            } catch (error) {
+                if (!(error instanceof DataIntegrityError)) {
+                    throw error;
+                }
+
+                lastExtractionError = error;
+                analyzeTrace("llm_extraction_invalid", { attempt, message: error.message });
+                console.warn(
+                    `LLM extraction attempt ${attempt}/${LLM_EXTRACTION_MAX_ATTEMPTS} rejected: ${error.message}`
+                );
+            }
         }
 
-        rawLlmResponse = ((await llmResponse.json()).response || "").trim();
-        analyzeTrace("llm_response_ok", { chars: rawLlmResponse.length });
-    } catch (error) {
-        analyzeTrace("llm_failed", { name: error.name, message: error.message });
-        console.error(`LLM analyze request failed (${error.name}): ${error.message}`);
-        return res.status(500).json({ error: "LLM analysis failed. The inference container did not return a result." });
-    }
+        if (!parsedExtraction) {
+            throw new DataIntegrityError(
+                `LLM extraction failed strict schema validation on all ${LLM_EXTRACTION_MAX_ATTEMPTS} attempts. ` +
+                    `Last failure: ${lastExtractionError.message}`
+            );
+        }
 
-    try {
-        const { extraction, triggerDistanceNM, turn } = parseRelationalLogic(rawLlmResponse);
+        const { extraction, triggerDistanceNM, turn } = parsedExtraction;
         analyzeTrace("distance_resolved", {
             triggerDistanceNM,
             trigger_type: extraction.trigger_type,
@@ -754,13 +654,34 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         // Stage 3: validated physical ground truth. AIRAC temporal enforcement
         // runs first inside the service; an expired cycle or any missing /
         // non-finite physical field throws before spatial math is reached.
+        // When the LLM extracted a trigger navaid ident, it is resolved here
+        // via the multi-tenant cascade (the requested operator's tailored
+        // dataset first, public FAA fallback second), each step applying the
+        // strict tiered lookup (terminal facilities at the airport first,
+        // enroute within 40 NM as fallback) — unresolvable is a 422.
         const groundTruth = await resolvePhysicalGroundTruth(
             airportId.trim(),
             runwayId.trim(),
             navaidId.trim(),
-            new Date().toISOString()
+            new Date().toISOString(),
+            {
+                triggerNavaidIdent: extraction.trigger_navaid_ident,
+                operatorId
+            }
         );
-        analyzeTrace("ground_truth_ok", { airac: groundTruth.airacCycle?.ident });
+        analyzeTrace("ground_truth_ok", {
+            airac: groundTruth.airacCycle?.ident,
+            triggerNavaid: groundTruth.triggerNavaid
+                ? {
+                    identifier: groundTruth.triggerNavaid.identifier,
+                    type: groundTruth.triggerNavaid.type,
+                    tier: groundTruth.triggerNavaid.selection.tier,
+                    distanceNM: groundTruth.triggerNavaid.selection.distanceNM,
+                    operator: groundTruth.triggerNavaid.selection.operator,
+                    dataset: groundTruth.triggerNavaid.selection.dataset
+                }
+                : null
+        });
 
         const origin = {
             latitude: groundTruth.originRunway.threshold.latitude,
@@ -770,12 +691,18 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
 
         // Stage 4: deterministic WGS-84 solving. The trigger point is the
         // forward intersection of the departure track with the DME arc around
-        // the validated navaid station.
-        analyzeTrace("geo_intersection_start", { triggerDistanceNM, departureTrueHeading });
+        // the station the charted distance is measured from: the LLM-extracted
+        // trigger navaid when present, otherwise the payload navaid.
+        const dmeStation = groundTruth.triggerNavaid ?? groundTruth.navaid;
+        analyzeTrace("geo_intersection_start", {
+            triggerDistanceNM,
+            departureTrueHeading,
+            dmeStation: dmeStation.identifier
+        });
         const intersection = GeoMath.calculateTrackCircleIntersection(
             origin,
             departureTrueHeading,
-            groundTruth.navaid.coordinates,
+            dmeStation.coordinates,
             triggerDistanceNM
         );
         const triggerPoint = { latitude: intersection.latitude, longitude: intersection.longitude };
@@ -836,6 +763,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         return res.json({
             extraction,
             airacCycle: groundTruth.airacCycle,
+            triggerNavaid: groundTruth.triggerNavaid,
             triggerPoint: {
                 ...triggerPoint,
                 distanceAlongTrackNM: intersection.distanceAlongTrackNM,
