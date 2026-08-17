@@ -64,6 +64,11 @@ function initGroundTruthService(db) {
  *   procedures (e.g. "AAL"). The trigger navaid is resolved against that
  *   operator's dataset first, falling back to the public FAA baseline;
  *   omitted means public-only.
+ * @param {string[]} [options.legNavaidIdents] - Phase 4.3: every distinct
+ *   station ident referenced by a runway's leg sequence. Each is resolved
+ *   through the same strict tiered/multi-tenant cascade as the trigger
+ *   navaid and returned in the `legNavaids` map (keyed by uppercased
+ *   ident). Any unresolvable ident throws DataIntegrityError.
  * @returns {Promise<object>} validated ground-truth contract (see below)
  * @throws {AiracExpiredError} when no loaded AIRAC cycle covers currentUtcTime
  * @throws {DataIntegrityError} when a record is missing or a physical field
@@ -134,6 +139,48 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
         };
     }
 
+    // 5. Phase 4.3 leg navaids: every distinct station referenced by the
+    //    runway's leg sequence, resolved through the identical tiered
+    //    multi-tenant cascade. The runway threshold anchors the spatial
+    //    search; any miss is a hard DataIntegrityError from the accessor.
+    const legNavaids = {};
+
+    if (Array.isArray(options.legNavaidIdents)) {
+        const uniqueIdents = [...new Set(
+            options.legNavaidIdents
+                .filter((ident) => typeof ident === "string" && ident.trim() !== "")
+                .map((ident) => ident.trim().toUpperCase())
+        )];
+
+        for (const ident of uniqueIdents) {
+            const resolved = await navDb.resolveTriggerNavaid(
+                ident,
+                {
+                    airportId: runway.airportCode,
+                    latitude: runway.latitude,
+                    longitude: runway.longitude
+                },
+                currentUtcTime,
+                options.operatorId
+            );
+
+            legNavaids[ident] = {
+                identifier: resolved.identifier,
+                name: resolved.name,
+                type: resolved.type,
+                state: resolved.state,
+                operator_id: resolved.operator_id,
+                coordinates: {
+                    latitude: resolved.latitude,
+                    longitude: resolved.longitude
+                },
+                elevationFtMsl: resolved.elevationFtMsl,
+                magneticVariation: resolved.magneticVariation,
+                selection: resolved.selection
+            };
+        }
+    }
+
     const disambiguation = navaid.disambiguation
         ? {
             ...navaid.disambiguation,
@@ -177,6 +224,7 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
         // published magnetically at the airport convert to True with this value.
         magneticVariation: runway.magneticVariation,
         triggerNavaid,
+        legNavaids,
         disambiguation
     };
 }

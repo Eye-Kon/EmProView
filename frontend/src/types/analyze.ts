@@ -1,3 +1,5 @@
+import type { FeatureCollection } from 'geojson'
+
 export interface AnalyzeRequest {
   /**
    * Base64-encoded procedure chart image (bare payload, no data-URL prefix).
@@ -49,6 +51,80 @@ export interface ProcedureLeg {
 export interface RunwayProcedure {
   identifier: string
   legs: ProcedureLeg[]
+}
+
+export interface LatLng {
+  latitude: number
+  longitude: number
+}
+
+/** One solved leg in a runway's parametric record (Phase 4.3 Stage 4). */
+export interface SolvedLeg {
+  legType: ProcedureLegType
+  provenance: LegProvenance
+  startPoint: LatLng
+  endPoint: LatLng
+  trueHeading?: number
+  dme?: {
+    navaid: string
+    distanceNM: number
+    distanceAlongTrackNM: number
+    dmeErrorNM: number
+  }
+  turn?: {
+    direction: 'left' | 'right'
+    directionSource: 'charted' | 'shortest_turn'
+    sweepDegrees: number
+    radiusNM: number
+    radiusSource: string
+    bankAngleDegrees: number
+    center: LatLng
+    entryTrueHeading: number
+    exitTrueHeading: number
+    targetMagneticHeading: number
+  }
+  climb?: {
+    targetAltitudeFtMsl: number
+    startAltitudeFtMsl: number
+    distanceNM: number
+    gradientFtPerNM: number
+    gradientSource: string
+  }
+}
+
+/** ARINC-style parametric source of truth for one runway's escape path. */
+export interface RunwayParametricPath {
+  runway: string
+  origin: LatLng
+  departureTrueHeading: number
+  finalTrueHeading: number
+  totalDistanceNM: number
+  finalAltitudeFtMsl: number | null
+  legs: SolvedLeg[]
+}
+
+/** Phase 4.3 response entry: extracted matrix row + solved geometry. */
+export interface SolvedRunway extends RunwayProcedure {
+  parametric: RunwayParametricPath
+  disambiguation: Disambiguation | null
+}
+
+/**
+ * Properties stamped on every feature of the unified escape-path
+ * FeatureCollection: LineString legs (role "leg") and DME trigger
+ * intersections (role "trigger_point").
+ */
+export interface EscapePathFeatureProperties {
+  runway: string
+  legIndex: number
+  legType: ProcedureLegType
+  provenance: LegProvenance
+  role: 'leg' | 'trigger_point'
+  /** Trigger points only. */
+  dmeDistanceNM?: number
+  navaid?: string
+  /** Final turn legs only: display-only rollout extension length. */
+  rolloutExtensionNM?: number
 }
 
 /**
@@ -126,13 +202,15 @@ export interface Disambiguation {
 }
 
 /**
- * Phase 4 response: the validated multi-runway leg matrix, returned directly
- * while the WGS-84 geometry cascade is bypassed. The geometry fields
- * (triggerPoint, parametric, geojson, ...) return once the cascade is
- * re-enabled per runway/leg.
+ * Phase 4.3 response: the validated multi-runway matrix with the WGS-84
+ * geometry cascade re-enabled per runway/leg. `geojson` is the single
+ * unified FeatureCollection covering every runway's escape path — the
+ * "spiderweb" the map renders in one pass.
  */
 export interface AnalyzeResponse {
-  runways: RunwayProcedure[]
+  runways: SolvedRunway[]
+  airacCycle: AiracCycle
+  geojson: FeatureCollection
   /** Stage-1 vision OCR markdown transcription, for matrix verification. */
   transcription: string
 }

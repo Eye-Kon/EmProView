@@ -294,6 +294,37 @@
   height: 100%;
 }
 
+.map-legend {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 1000;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.85rem;
+  max-width: 60%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.65rem;
+  background: rgba(15, 23, 42, 0.82);
+  border: 1px solid #334155;
+  font-size: 0.8rem;
+  color: #e2e8f0;
+}
+
+.map-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.map-legend-swatch {
+  width: 0.85rem;
+  height: 0.25rem;
+  border-radius: 999px;
+  display: inline-block;
+}
+
 .map-empty-state {
   position: absolute;
   inset: auto 1rem 1rem 1rem;

@@ -34,8 +34,8 @@ function analyzeTrace(stage, details = {}) {
         console.error(`[analyze] failed to write trace file: ${error.message}`);
     }
 }
-const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
-const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
+const { AiracExpiredError, DataIntegrityError } = require("./backend/geo_engine");
+const { solveRunwayEscapePath } = require("./backend/geo/MultiLegSolver");
 const { parseRunwayMatrix } = require("./backend/extraction/parseRunwayMatrix");
 const { buildProvenanceGrid } = require("./backend/extraction/tier2Classifier");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
@@ -803,145 +803,124 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         });
 
         // ============================================================
-        // PHASE 4 TEMPORARY BYPASS: Stages 3 (physical ground truth) and
-        // 4 (WGS-84 geometry cascade) are disabled while the multi-runway
-        // matrix extraction is verified. The validated JSON array is
-        // returned directly to the frontend. The original per-runway
-        // geometry code is preserved below for reinstatement once the
-        // matrix extraction is proven; it must then run per runway/leg
-        // instead of on the retired flat extraction fields.
+        // Phase 4.3: Stages 3 (physical ground truth) and 4 (WGS-84
+        // geodesic solving) run PER RUNWAY over the validated matrix.
+        // Every runway's leg sequence becomes an ordered chain of solved
+        // segments; all segments aggregate into ONE unified GeoJSON
+        // FeatureCollection (the "spiderweb"). No runway degrades
+        // gracefully: a single unresolvable runway, station, or climb
+        // anchor rejects the whole computation with a 422.
         // ============================================================
-        analyzeTrace("request_complete", { geometryBypassed: true });
+        const resolutionTime = new Date().toISOString();
+        const solvedRunways = [];
+        const allFeatures = [];
+        let airacCycle = null;
 
-        return res.json({
-            runways: parsedMatrix.runways,
-            transcription: procedureText
-        });
+        for (const runway of parsedMatrix.runways) {
+            // Stage 3: validated physical ground truth for THIS runway end.
+            // AIRAC temporal enforcement runs first inside the service; the
+            // threshold, the payload navaid, and every station any leg
+            // references are resolved through the strict multi-tenant
+            // cascade (tailored dataset first, public FAA fallback second;
+            // terminal facilities at the airport first, enroute within
+            // 40 NM as fallback) — unresolvable is a 422.
+            const legNavaidIdents = [...new Set(
+                runway.legs
+                    .filter((leg) => typeof leg.navaid === "string" && leg.navaid.trim() !== "")
+                    .map((leg) => leg.navaid.trim().toUpperCase())
+            )];
 
-        /* --- BYPASSED STAGE 3/4 GEOMETRY CASCADE (pre-Phase 4 flat schema) ---
-        // Stage 3: validated physical ground truth. AIRAC temporal enforcement
-        // runs first inside the service; an expired cycle or any missing /
-        // non-finite physical field throws before spatial math is reached.
-        // When the LLM extracted a trigger navaid ident, it is resolved here
-        // via the multi-tenant cascade (the requested operator's tailored
-        // dataset first, public FAA fallback second), each step applying the
-        // strict tiered lookup (terminal facilities at the airport first,
-        // enroute within 40 NM as fallback) — unresolvable is a 422.
-        const groundTruth = await resolvePhysicalGroundTruth(
-            airportId.trim(),
-            runwayId.trim(),
-            navaidId.trim(),
-            new Date().toISOString(),
-            {
-                triggerNavaidIdent: extraction.trigger_navaid_ident,
-                operatorId
-            }
-        );
-        analyzeTrace("ground_truth_ok", {
-            airac: groundTruth.airacCycle?.ident,
-            triggerNavaid: groundTruth.triggerNavaid
-                ? {
-                    identifier: groundTruth.triggerNavaid.identifier,
-                    type: groundTruth.triggerNavaid.type,
-                    tier: groundTruth.triggerNavaid.selection.tier,
-                    distanceNM: groundTruth.triggerNavaid.selection.distanceNM,
-                    operator: groundTruth.triggerNavaid.selection.operator,
-                    dataset: groundTruth.triggerNavaid.selection.dataset
-                }
-                : null
-        });
-
-        const origin = {
-            latitude: groundTruth.originRunway.threshold.latitude,
-            longitude: groundTruth.originRunway.threshold.longitude
-        };
-        const departureTrueHeading = groundTruth.originRunway.trueHeading;
-
-        // Stage 4: deterministic WGS-84 solving. The trigger point is the
-        // forward intersection of the departure track with the DME arc around
-        // the station the charted distance is measured from: the LLM-extracted
-        // trigger navaid when present, otherwise the payload navaid.
-        const dmeStation = groundTruth.triggerNavaid ?? groundTruth.navaid;
-        analyzeTrace("geo_intersection_start", {
-            triggerDistanceNM,
-            departureTrueHeading,
-            dmeStation: dmeStation.identifier
-        });
-        const intersection = GeoMath.calculateTrackCircleIntersection(
-            origin,
-            departureTrueHeading,
-            dmeStation.coordinates,
-            triggerDistanceNM
-        );
-        const triggerPoint = { latitude: intersection.latitude, longitude: intersection.longitude };
-        analyzeTrace("geo_intersection_ok", {
-            distanceAlongTrackNM: intersection.distanceAlongTrackNM,
-            dmeErrorNM: intersection.dmeErrorNM
-        });
-
-        let resolvedTurn = null;
-
-        if (turn) {
-            let targetTrueHeading;
-
-            if (turn.magneticHeading !== null && turn.magneticHeading !== undefined) {
-                // True North normalization: magnetic heading → True via DB variation.
-                targetTrueHeading = GeoMath.magneticToTrue(
-                    turn.magneticHeading,
-                    groundTruth.magneticVariation
-                );
-            } else {
-                // Turn direct to navaid/fix: outbound course is the True bearing
-                // from the computed trigger point to the resolved station.
-                targetTrueHeading = GeoMath.trueBearingBetween(
-                    triggerPoint,
-                    groundTruth.navaid.coordinates
-                );
-            }
-
-            const turnEvaluation = GeoMath.getAngularDifference(
-                departureTrueHeading,
-                targetTrueHeading,
-                turn.turnDirection
+            analyzeTrace("ground_truth_start", { runway: runway.identifier, legNavaidIdents });
+            const groundTruth = await resolvePhysicalGroundTruth(
+                airportId.trim(),
+                runway.identifier,
+                navaidId.trim(),
+                resolutionTime,
+                { legNavaidIdents, operatorId }
             );
+            airacCycle = groundTruth.airacCycle;
+            analyzeTrace("ground_truth_ok", {
+                runway: runway.identifier,
+                airac: groundTruth.airacCycle?.ident,
+                threshold: groundTruth.originRunway.threshold,
+                trueHeading: groundTruth.originRunway.trueHeading,
+                magneticVariation: groundTruth.magneticVariation,
+                legNavaids: Object.fromEntries(
+                    Object.entries(groundTruth.legNavaids).map(([ident, station]) => [ident, {
+                        type: station.type,
+                        tier: station.selection.tier,
+                        distanceNM: station.selection.distanceNM,
+                        dataset: station.selection.dataset
+                    }])
+                )
+            });
 
-            resolvedTurn = {
-                targetTrueHeading: turnEvaluation.targetHeading,
-                turnDegrees: turnEvaluation.turnDegrees,
-                turnDirection: turnEvaluation.turnDirection
-            };
-            analyzeTrace("turn_resolved", {
-                turnDegrees: resolvedTurn.turnDegrees,
-                turnDirection: resolvedTurn.turnDirection,
-                via: turn.magneticHeading !== null ? "magnetic_heading" : "direct_to_navaid",
-                targetNavaid: turn.targetNavaid
+            // Climb-profile anchor for TRACK_TO_ALTITUDE legs: the validated
+            // MSL elevation of a resolved terminal station at the airport
+            // (a terminal DME sits on the field), else any resolved leg
+            // station. Runways whose legs never trigger on altitude do not
+            // need one; the solver enforces this per leg.
+            const resolvedStations = Object.values(groundTruth.legNavaids);
+            const terminalStation = resolvedStations.find((station) => station.selection.tier === "terminal");
+            const elevationSource = terminalStation ?? resolvedStations[0] ?? null;
+            const startElevationFtMsl = Number.isFinite(elevationSource?.elevationFtMsl)
+                ? elevationSource.elevationFtMsl
+                : null;
+
+            // Stage 4: deterministic WGS-84 multi-leg solving. The solver
+            // walks the leg chain sequentially — each leg starts where the
+            // previous one ended, on the heading the previous one rolled
+            // out on. Provenance (CHARTED vs ROWSPAN_INHERITED) rides along
+            // as UI metadata only; the vector math is identical.
+            analyzeTrace("path_solve_start", { runway: runway.identifier, legCount: runway.legs.length });
+            const solved = solveRunwayEscapePath({
+                runwayId: groundTruth.originRunway.runwayId,
+                origin: groundTruth.originRunway.threshold,
+                departureTrueHeading: groundTruth.originRunway.trueHeading,
+                magneticVariation: groundTruth.magneticVariation,
+                startElevationFtMsl,
+                legs: runway.legs,
+                stationsByIdent: groundTruth.legNavaids,
+                defaultStation: {
+                    identifier: groundTruth.navaid.identifier,
+                    coordinates: groundTruth.navaid.coordinates
+                }
+            });
+            analyzeTrace("path_solve_ok", {
+                runway: runway.identifier,
+                featureCount: solved.features.length,
+                totalDistanceNM: solved.parametric.totalDistanceNM,
+                finalTrueHeading: solved.parametric.finalTrueHeading
+            });
+
+            allFeatures.push(...solved.features);
+            solvedRunways.push({
+                identifier: runway.identifier,
+                legs: runway.legs,
+                parametric: solved.parametric,
+                disambiguation: groundTruth.disambiguation
             });
         }
 
-        analyzeTrace("path_build_start", { turnDegrees: resolvedTurn?.turnDegrees ?? null });
-        const path = buildTriggeredTurnPath({
-            origin,
-            triggerPoint,
-            departureTrueHeading,
-            turn: resolvedTurn,
-            runway: groundTruth.originRunway.runwayId
+        // Unified FeatureCollection: every leg segment and trigger point of
+        // every runway, each feature tagged with { runway, legType,
+        // provenance } so the frontend can style the spiderweb distinctly.
+        const geojson = {
+            type: "FeatureCollection",
+            features: allFeatures
+        };
+
+        analyzeTrace("request_complete", {
+            runwayCount: solvedRunways.length,
+            featureCount: allFeatures.length
         });
-        analyzeTrace("request_complete", { legType: path.parametric?.legType });
 
         return res.json({
-            extraction,
-            airacCycle: groundTruth.airacCycle,
-            triggerNavaid: groundTruth.triggerNavaid,
-            triggerPoint: {
-                ...triggerPoint,
-                distanceAlongTrackNM: intersection.distanceAlongTrackNM,
-                dmeErrorNM: intersection.dmeErrorNM
-            },
-            parametric: path.parametric,
-            geojson: path.geojson,
-            disambiguation: groundTruth.disambiguation
+            runways: solvedRunways,
+            airacCycle,
+            geojson,
+            transcription: procedureText
         });
-        --- END BYPASSED STAGE 3/4 GEOMETRY CASCADE --- */
     } catch (error) {
         analyzeTrace("pipeline_failed", { name: error.name, message: error.message });
         // Every 422 carries the Stage-1 transcription: when downstream stages

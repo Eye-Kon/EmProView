@@ -94,9 +94,9 @@ function App() {
           </div>
         ) : null}
 
-        {/* Phase 4: geometry cascade is bypassed server-side, so no geojson
-            or trigger point is available yet — the map renders empty. */}
-        <MapCanvas geojson={null} triggerPoint={null} />
+        {/* Phase 4.3: the unified FeatureCollection carries every runway's
+            solved escape path — the map renders the full spiderweb at once. */}
+        <MapCanvas geojson={result?.geojson ?? null} />
 
         <DataReadout
           runways={result?.runways ?? null}
