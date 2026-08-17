@@ -609,11 +609,24 @@ Output only the raw textual procedure instructions with no preamble, summary, or
         });
     }
 
+    // Chart-shorthand normalization: Jeppesen EFP tables write DME triggers
+    // as "D<distance>" next to the station ident (e.g. "AT D11.6 TCH"). The
+    // extraction model only reliably recognizes the long form ("11.6 DME
+    // TCH") — prompt-rule variants proved brittle at q4, so the shorthand is
+    // rewritten mechanically. Deterministic, logged, and the numeric value is
+    // never altered. Trailing \b leaves radial-distance fix names (e.g.
+    // "D251K") untouched.
+    const normalizedProcedureText = procedureText.replace(/\bD(\d+(?:\.\d+)?)\b/g, "$1 DME");
+
+    if (normalizedProcedureText !== procedureText) {
+        analyzeTrace("shorthand_normalized", { normalized: normalizedProcedureText });
+    }
+
     const prompt =
         `You are a precision aviation data extraction tool.\n` +
         `From the procedure text below, extract the relational logic of the procedure, ` +
         `with particular focus on: ${extractionTarget}.\n\n` +
-        `PROCEDURE TEXT:\n${procedureText}\n\n` +
+        `PROCEDURE TEXT:\n${normalizedProcedureText}\n\n` +
         `Respond with ONLY a single flat JSON object in exactly this shape (every field present, no nesting):\n` +
         `{"extracted_value": "<the value of ${extractionTarget}>", ` +
         `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
