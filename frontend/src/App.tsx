@@ -94,14 +94,13 @@ function App() {
           </div>
         ) : null}
 
-        <MapCanvas
-          geojson={result?.geojson ?? null}
-          triggerPoint={result?.triggerPoint ?? null}
-        />
+        {/* Phase 4: geometry cascade is bypassed server-side, so no geojson
+            or trigger point is available yet — the map renders empty. */}
+        <MapCanvas geojson={null} triggerPoint={null} />
 
         <DataReadout
-          extraction={result?.extraction ?? null}
-          triggerPoint={result?.triggerPoint ?? null}
+          runways={result?.runways ?? null}
+          transcription={result?.transcription ?? null}
         />
       </main>
     </div>

@@ -36,7 +36,8 @@ function analyzeTrace(stage, details = {}) {
 }
 const { AiracExpiredError, DataIntegrityError, GeoMath } = require("./backend/geo_engine");
 const { buildTriggeredTurnPath } = require("./backend/geo/PathGeometry");
-const { parseRelationalLogic } = require("./backend/extraction/parseRelationalLogic");
+const { parseRunwayMatrix } = require("./backend/extraction/parseRunwayMatrix");
+const { buildProvenanceGrid } = require("./backend/extraction/tier2Classifier");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
 const { createBatchJob, initBatchWorker, JOBS_COLLECTION, RESULTS_COLLECTION } = require("./backend/jobs/batchProcessor");
@@ -503,11 +504,13 @@ function requireAnalyzeAuth(req, res, next) {
 // No stage degrades gracefully: expired, missing, or non-finite physical
 // data rejects the computation with a 422 and the exact failure message.
 app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
+    // Phase 4: runwayId is no longer part of the request contract — the
+    // pipeline extracts the ENTIRE engine-failure-procedure matrix (every
+    // runway, every leg) from the chart in one pass.
     const {
         image_base64: rawImageBase64,
         extraction_target: extractionTarget,
         airportId,
-        runwayId,
         navaidId,
         operator_id: rawOperatorId
     } = req.body || {};
@@ -516,14 +519,13 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         ["image_base64", rawImageBase64],
         ["extraction_target", extractionTarget],
         ["airportId", airportId],
-        ["runwayId", runwayId],
         ["navaidId", navaidId]
     ].filter(([, value]) => typeof value !== "string" || value.trim() === "").map(([name]) => name);
 
     if (missing.length > 0) {
         return res.status(400).json({
             error: `Missing required fields: ${missing.join(", ")}. ` +
-                `image_base64, extraction_target, airportId, runwayId, and navaidId must all be provided.`
+                `image_base64, extraction_target, airportId, and navaidId must all be provided.`
         });
     }
 
@@ -547,7 +549,6 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
 
     analyzeTrace("request_received", {
         airportId,
-        runwayId,
         navaidId,
         operatorId,
         extractionTarget,
@@ -559,14 +560,18 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
     // below); re-running the same image through the same weights at
     // temperature 0 cannot produce a different outcome.
     //
-    // Context-aware, verbatim prompt: naming the target runway anchors the
-    // model on the correct EFP block of a multi-runway chart, and the
-    // verbatim directive suppresses the summarization failure mode that
-    // silently dropped charted DME values from the transcription.
-    const visionPrompt = `You are an expert aeronautical data extractor.
-Locate and transcribe the Engine Failure Procedure (Special Engine-Out Departure / EFP) specifically for Runway ${runwayId || 'the specified runway'} from this chart.
-Transcribe verbatim, preserving every number, heading, altitude, waypoint name, and DME distance exactly as printed.
-Output only the raw textual procedure instructions with no preamble, summary, or commentary.`;
+    // Full-table transcription (Phase 4.2): back to Markdown. The Tier-1
+    // HTML experiment proved the 7B q4 vision model transcribes cell TEXT
+    // faithfully but hallucinates STRUCTURE when asked to author rowspans
+    // (it merged headers and flattened the real data merges). Markdown is
+    // the reliable content channel; empty cells are resolved afterward by
+    // the Tier-2 targeted classifier (one constrained visual question per
+    // ambiguous cell), never inferred from the text.
+    const visionPrompt = `You are a precision aeronautical OCR system. ` +
+        `Locate the 'ENGINE FAILURE PROCEDURES' table. ` +
+        `Transcribe the ENTIRE table exactly as printed into a clean Markdown table. ` +
+        `If a cell is blank or visually merged with another, leave it completely empty (e.g., | |). ` +
+        `Do not use HTML.`;
 
     let procedureText;
 
@@ -592,6 +597,22 @@ Output only the raw textual procedure instructions with no preamble, summary, or
         }
 
         procedureText = ((await visionResponse.json()).response || "").trim();
+
+        // Fence stripping: the vision model wraps transcriptions in code
+        // fences (```html ... ```) despite the prompt. Deterministic removal
+        // of one leading and one trailing fence line only — table content is
+        // never touched, and an unfenced transcription passes through
+        // unchanged. parse5 also tolerates stray prose around the <table>.
+        const defenced = procedureText
+            .replace(/^```[\w-]*[ \t]*\r?\n?/, "")
+            .replace(/\r?\n?```[ \t]*$/, "")
+            .trim();
+
+        if (defenced !== procedureText) {
+            analyzeTrace("vision_fences_stripped", { rawChars: procedureText.length, strippedChars: defenced.length });
+            procedureText = defenced;
+        }
+
         // Full transcription goes into the trace: extraction failures are
         // undiagnosable without seeing exactly what the vision pass produced.
         analyzeTrace("vision_response_ok", { chars: procedureText.length, transcription: procedureText });
@@ -609,79 +630,127 @@ Output only the raw textual procedure instructions with no preamble, summary, or
         });
     }
 
-    // Chart-shorthand normalization: Jeppesen EFP tables write DME triggers
-    // as "D<distance>" next to the station ident (e.g. "AT D11.6 TCH"). The
-    // extraction model only reliably recognizes the long form ("11.6 DME
-    // TCH") — prompt-rule variants proved brittle at q4, so the shorthand is
-    // rewritten mechanically. Deterministic, logged, and the numeric value is
-    // never altered. Trailing \b leaves radial-distance fix names (e.g.
-    // "D251K") untouched.
-    const normalizedProcedureText = procedureText.replace(/\bD(\d+(?:\.\d+)?)\b/g, "$1 DME");
-
-    if (normalizedProcedureText !== procedureText) {
-        analyzeTrace("shorthand_normalized", { normalized: normalizedProcedureText });
-    }
-
-    const prompt =
-        `You are a precision aviation data extraction tool.\n` +
-        `From the procedure text below, extract the relational logic of the procedure, ` +
-        `with particular focus on: ${extractionTarget}.\n\n` +
-        `PROCEDURE TEXT:\n${normalizedProcedureText}\n\n` +
-        `Respond with ONLY a single flat JSON object in exactly this shape (every field present, no nesting):\n` +
-        `{"extracted_value": "<the value of ${extractionTarget}>", ` +
-        `"turn_direction": "<LEFT, RIGHT, or NONE>", ` +
-        `"initial_magnetic_heading": <the initial climb/runway magnetic heading as a number, or null if not stated>, ` +
-        `"trigger_type": "<REQUIRED: exactly one of altitude, dme, or unspecified — lowercase, never null>", ` +
-        `"trigger_altitude_msl": <the altitude in feet MSL that triggers the action as a number, or null if not stated>, ` +
-        `"trigger_dme_distance_nm": <the DME distance in nautical miles at which the action occurs as a number, or null if not stated>, ` +
-        `"trigger_navaid_ident": <the identifier of the DME station/navaid the distance is measured from as a string, or null if not stated>, ` +
-        `"climb_gradient_ft_nm": <the climb gradient in feet per nautical mile if stated as a number, or null if not stated>, ` +
-        `"target_magnetic_heading": <the commanded magnetic heading after the action as a number, or null if none>, ` +
-        `"target_navaid": <the navaid or fix identifier turned direct-to as a string, or null if none>}\n` +
-        `TRIGGER RULES:\n` +
-        `- If the text states a DME/lateral distance (e.g. "until 3.5 DME" or "at 4 DME CLT"), set trigger_type to "dme", ` +
-        `set trigger_dme_distance_nm to that number, set trigger_navaid_ident to the DME station identifier if one is named ` +
-        `(otherwise null), and set trigger_altitude_msl to null.\n` +
-        `- If no DME distance is provided but an altitude restriction is stated ` +
-        `(e.g. "Climb to 4500 MSL before turning"), set trigger_type to "altitude", set trigger_altitude_msl to that altitude, ` +
-        `and set trigger_dme_distance_nm and trigger_navaid_ident to null.\n` +
-        `- If the text states neither a DME distance nor a trigger altitude, set trigger_type to "unspecified" ` +
-        `and set trigger_altitude_msl, trigger_dme_distance_nm, and trigger_navaid_ident all to null.\n` +
-        `- Extract climb_gradient_ft_nm only when the text explicitly states a climb gradient; otherwise null.\n` +
-        `- trigger_type is MANDATORY and must be exactly "altitude", "dme", or "unspecified" in lowercase. ` +
-        `Never omit it, never set it to null, never use any other value.\n` +
-        `- NEVER output a field named "trigger_distance_nm". The only distance field in this schema is trigger_dme_distance_nm.\n` +
-        `TURN RULES:\n` +
-        `- If turn_direction is LEFT or RIGHT and the text commands a numeric heading after the turn, set target_magnetic_heading.\n` +
-        `- If the text says turn direct to a navaid/fix (e.g. "climbing right turn direct CLT") with no post-turn heading, ` +
-        `set target_navaid to that ident and set target_magnetic_heading to null.\n` +
-        `- When turn_direction is LEFT or RIGHT, at least one of target_magnetic_heading or target_navaid MUST be present.\n` +
-        `Emit numeric fields as JSON numbers when known (not quoted strings).\n` +
-        `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
-        `Output the raw JSON object and nothing else.`;
-
     try {
-        // Stage 2: LLM extraction with a bounded retry loop. Each attempt is
-        // a full round trip: Ollama call (format: "json", deterministic
-        // options), then strict schema validation via parseRelationalLogic.
-        // Malformed JSON or a schema violation (DataIntegrityError) retries
-        // up to LLM_EXTRACTION_MAX_ATTEMPTS; infrastructure failure (the
+        // Tier 2 structural resolution: the Markdown transcription is parsed
+        // deterministically into a grid, and every empty AT/TURN cell on a
+        // runway row triggers ONE targeted vision classification of that
+        // physical cell (MERGED / BLANK / TEXT). MERGED inherits the
+        // resolved cell above with ROWSPAN_INHERITED provenance; BLANK stays
+        // charted-empty; TEXT means the transcription dropped printed data
+        // and the run fails. Structure comes from the image, never from
+        // text-domain inference; every anomaly is a DataIntegrityError ->
+        // 422 handled by the catch below.
+        const { grid, classifierResults } = await buildProvenanceGrid(procedureText, {
+            imageBase64,
+            visionModelName: VISION_MODEL_NAME,
+            trace: analyzeTrace
+        });
+        analyzeTrace("grid_built", {
+            rows: grid.length,
+            columns: grid[0]?.length ?? 0,
+            classifierCalls: classifierResults.length,
+            classifierResults,
+            inheritedCells: grid.flat().filter((cell) => cell.provenance === "ROWSPAN_INHERITED").length
+        });
+
+        // Chart-shorthand normalization: Jeppesen EFP tables write DME
+        // triggers as "D<distance>" next to the station ident (e.g. "AT
+        // D11.6 TCH"). The extraction model only reliably recognizes the
+        // long form ("11.6 DME TCH") — prompt-rule variants proved brittle
+        // at q4, so the shorthand is rewritten mechanically on every cell of
+        // the expanded grid before any text reaches the LLM. Deterministic,
+        // logged, and the numeric value is never altered. Trailing \b leaves
+        // radial-distance fix names (e.g. "D251K") untouched.
+        let shorthandRewritten = false;
+        const normalizedGrid = grid.map((row) => row.map((cell) => {
+            const normalizedText = cell.text.replace(/\bD(\d+(?:\.\d+)?)\b/g, "$1 DME");
+
+            if (normalizedText !== cell.text) {
+                shorthandRewritten = true;
+            }
+
+            return { text: normalizedText, provenance: cell.provenance };
+        }));
+
+        if (shorthandRewritten) {
+            analyzeTrace("shorthand_normalized", { grid: normalizedGrid });
+        }
+
+        const gridJson = JSON.stringify(normalizedGrid);
+
+        // Phase 4.2 semantic parser: merged cells are already resolved by
+        // the Tier-2 classifier, so the LLM never deduces table structure.
+        // Its only jobs are unrolling grouped identifiers (16L/R -> 16L,
+        // 16R) and mapping cell text onto the leg schema — carrying each
+        // source cell's provenance tag through to the leg it produced.
+        const prompt =
+            `You are a precision aviation data extraction tool.\n` +
+            `The input below is a JSON grid of an ENGINE FAILURE PROCEDURES table: an array of rows, ` +
+            `each row an array of cells, each cell {"text": "...", "provenance": "CHARTED" | "ROWSPAN_INHERITED"}. ` +
+            `Vertically merged cells have ALREADY been expanded — every runway row is fully populated. ` +
+            `Parse it into structured leg sequences, with particular focus on: ${extractionTarget}.\n\n` +
+            `PROCEDURE GRID:\n${gridJson}\n\n` +
+            `Respond with ONLY a single JSON object in exactly this shape:\n` +
+            `{"runways": [{"identifier": "<individual runway, e.g. '16L', '16R', '35'>", ` +
+            `"legs": [{"type": "<exactly one of TRACK_TO_DME, TURN_TO_HEADING, TRACK_TO_ALTITUDE>", ` +
+            `"value": <number>, ` +
+            `"navaid": <DME station/navaid identifier as a string (e.g. "TCH"), or null if none>, ` +
+            `"direction": <"LEFT", "RIGHT", or null>, ` +
+            `"provenance": "<exactly the provenance of the grid cell this leg's data came from>"}]}]}\n` +
+            `LEG RULES:\n` +
+            `- Skip title/header rows (e.g. "ENGINE FAILURE PROCEDURES", "TAKEOFF", "RWY / AT / TURN"); ` +
+            `extract only runway data rows.\n` +
+            `- Emit one leg object per instruction, in the order the cells state them. ` +
+            `Cells with empty text contain no instruction — emit no leg for them.\n` +
+            `- TRACK_TO_DME: the procedure tracks until a DME distance (e.g. "11.6 DME TCH"). ` +
+            `Set value to the DME distance in nautical miles and navaid to the station identifier if named (otherwise null).\n` +
+            `- TURN_TO_HEADING: the procedure commands a turn to a magnetic heading. Set value to the heading as a number ` +
+            `and direction to "LEFT" or "RIGHT" if the turn direction is stated (otherwise null).\n` +
+            `- TRACK_TO_ALTITUDE: the procedure climbs until an altitude restriction. Set value to the altitude in feet MSL.\n` +
+            `- direction is only "LEFT" or "RIGHT" on turn legs with a stated direction; otherwise it must be null.\n` +
+            `PROVENANCE RULES:\n` +
+            `- provenance is REQUIRED on every leg. Copy the "provenance" value of the exact grid cell the leg's data ` +
+            `came from: "CHARTED" or "ROWSPAN_INHERITED". Never omit it, never invent it, never change it.\n` +
+            `MATRIX UNROLLING:\n` +
+            `- If a runway cell groups multiple runways (e.g. '16L/R' or '16L, 17'), you must unroll them and create a ` +
+            `separate, identical JSON object for each individual runway ('16L', '16R', '17') in the output array.\n` +
+            `- Every "identifier" in the output must be a single runway (e.g. "16L"), never a grouped identifier.\n` +
+            `Emit numeric fields as JSON numbers (not quoted strings).\n` +
+            `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
+            `Output the raw JSON object and nothing else.`;
+
+        // Stage 2: LLM extraction with a bounded CORRECTIVE retry loop. Each
+        // attempt is a full round trip: Ollama call (format: "json",
+        // deterministic options), then strict schema validation via
+        // parseRunwayMatrix. At temperature 0 an identical prompt reproduces
+        // an identical (rejected) response, so attempts 2..N append the exact
+        // validation failure to the prompt — the retry becomes a repair
+        // instruction instead of a replay. Infrastructure failure (the
         // inference container unreachable / HTTP error / timeout) is still
         // an immediate 500 — retrying cannot fix a downed dependency.
-        let parsedExtraction = null;
+        let parsedMatrix = null;
         let lastExtractionError = null;
 
         for (let attempt = 1; attempt <= LLM_EXTRACTION_MAX_ATTEMPTS; attempt += 1) {
+            const attemptPrompt = lastExtractionError === null
+                ? prompt
+                : `${prompt}\n\n` +
+                    `CORRECTION REQUIRED:\n` +
+                    `Your previous response was rejected by strict schema validation for this reason:\n` +
+                    `${lastExtractionError.message}\n` +
+                    `Fix exactly that problem and re-emit the COMPLETE corrected JSON object for the entire table. ` +
+                    `Output the raw JSON object and nothing else.`;
+
             let rawLlmResponse;
 
             try {
-                analyzeTrace("llm_request_start", { attempt });
+                analyzeTrace("llm_request_start", { attempt, corrective: lastExtractionError !== null });
                 const llmResponse = await fetch("http://llm:11434/api/generate", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         model: process.env.LLM_MODEL_NAME || "llama3:8b-instruct-q4_K_M",
-                        prompt,
+                        prompt: attemptPrompt,
                         stream: false,
                         format: "json",
                         options: LLM_EXTRACTION_OPTIONS
@@ -703,7 +772,7 @@ Output only the raw textual procedure instructions with no preamble, summary, or
             }
 
             try {
-                parsedExtraction = parseRelationalLogic(rawLlmResponse);
+                parsedMatrix = parseRunwayMatrix(rawLlmResponse);
                 break;
             } catch (error) {
                 if (!(error instanceof DataIntegrityError)) {
@@ -718,24 +787,38 @@ Output only the raw textual procedure instructions with no preamble, summary, or
             }
         }
 
-        if (!parsedExtraction) {
+        if (!parsedMatrix) {
             throw new DataIntegrityError(
                 `LLM extraction failed strict schema validation on all ${LLM_EXTRACTION_MAX_ATTEMPTS} attempts. ` +
                     `Last failure: ${lastExtractionError.message}`
             );
         }
 
-        const { extraction, triggerDistanceNM, turn } = parsedExtraction;
-        analyzeTrace("distance_resolved", {
-            triggerDistanceNM,
-            trigger_type: extraction.trigger_type,
-            trigger_dme_distance_nm: extraction.trigger_dme_distance_nm,
-            trigger_altitude_msl: extraction.trigger_altitude_msl,
-            trigger_navaid_ident: extraction.trigger_navaid_ident,
-            climb_gradient_ft_nm: extraction.climb_gradient_ft_nm,
-            turnDirection: turn?.turnDirection ?? null
+        analyzeTrace("matrix_extracted", {
+            runwayCount: parsedMatrix.runways.length,
+            runways: parsedMatrix.runways.map((runway) => ({
+                identifier: runway.identifier,
+                legCount: runway.legs.length
+            }))
         });
 
+        // ============================================================
+        // PHASE 4 TEMPORARY BYPASS: Stages 3 (physical ground truth) and
+        // 4 (WGS-84 geometry cascade) are disabled while the multi-runway
+        // matrix extraction is verified. The validated JSON array is
+        // returned directly to the frontend. The original per-runway
+        // geometry code is preserved below for reinstatement once the
+        // matrix extraction is proven; it must then run per runway/leg
+        // instead of on the retired flat extraction fields.
+        // ============================================================
+        analyzeTrace("request_complete", { geometryBypassed: true });
+
+        return res.json({
+            runways: parsedMatrix.runways,
+            transcription: procedureText
+        });
+
+        /* --- BYPASSED STAGE 3/4 GEOMETRY CASCADE (pre-Phase 4 flat schema) ---
         // Stage 3: validated physical ground truth. AIRAC temporal enforcement
         // runs first inside the service; an expired cycle or any missing /
         // non-finite physical field throws before spatial math is reached.
@@ -858,6 +941,7 @@ Output only the raw textual procedure instructions with no preamble, summary, or
             geojson: path.geojson,
             disambiguation: groundTruth.disambiguation
         });
+        --- END BYPASSED STAGE 3/4 GEOMETRY CASCADE --- */
     } catch (error) {
         analyzeTrace("pipeline_failed", { name: error.name, message: error.message });
         // Every 422 carries the Stage-1 transcription: when downstream stages

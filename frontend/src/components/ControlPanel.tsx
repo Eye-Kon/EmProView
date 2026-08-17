@@ -110,8 +110,8 @@ export function ControlPanel({
         <p className="eyebrow">EmProView</p>
         <h1>Geodetic Path Analyzer</h1>
         <p className="panel-subtitle">
-          Upload a procedure chart and provide the physical identifiers to
-          solve the trigger point and render the computed flight path.
+          Upload a procedure chart to extract the full engine failure
+          procedure matrix — every runway and its leg sequence.
         </p>
       </header>
 
@@ -218,16 +218,6 @@ export function ControlPanel({
               type="text"
               value={values.airportId}
               onChange={(event) => onChange('airportId', event.target.value)}
-              disabled={loading}
-            />
-          </label>
-
-          <label className="field">
-            <span>Runway ID</span>
-            <input
-              type="text"
-              value={values.runwayId}
-              onChange={(event) => onChange('runwayId', event.target.value)}
               disabled={loading}
             />
           </label>

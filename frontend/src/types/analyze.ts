@@ -1,14 +1,14 @@
-import type { FeatureCollection } from 'geojson'
-
 export interface AnalyzeRequest {
   /**
    * Base64-encoded procedure chart image (bare payload, no data-URL prefix).
    * The backend runs vision OCR on it before semantic extraction.
+   *
+   * Phase 4: no runwayId — the backend extracts the entire engine-failure-
+   * procedure matrix (every runway on the chart) in a single pass.
    */
   image_base64: string
   extraction_target: string
   airportId: string
-  runwayId: string
   navaidId: string
   /**
    * Optional tenant discriminator for tailored procedures (e.g. "AAL").
@@ -19,6 +19,42 @@ export interface AnalyzeRequest {
   operator_id?: string
 }
 
+/** ARINC 424-style leg discriminator emitted by the Phase 4 extraction. */
+export type ProcedureLegType =
+  | 'TRACK_TO_DME'
+  | 'TURN_TO_HEADING'
+  | 'TRACK_TO_ALTITUDE'
+
+/**
+ * Audit-trail tag from the Tier-1 occupancy-grid expansion:
+ * CHARTED — the value was physically printed in this runway's own table cell;
+ * ROWSPAN_INHERITED — the cell was filled by expanding a vertical merge
+ * (rowspan) from the row above.
+ */
+export type LegProvenance = 'CHARTED' | 'ROWSPAN_INHERITED'
+
+export interface ProcedureLeg {
+  type: ProcedureLegType
+  /** DME distance NM, magnetic heading, or altitude ft MSL — per leg type. */
+  value: number
+  /** DME station / navaid ident (e.g. "TCH") when charted; null otherwise. */
+  navaid: string | null
+  /** Turn direction on TURN_TO_HEADING legs when charted; null otherwise. */
+  direction: 'LEFT' | 'RIGHT' | null
+  /** Source of this leg's data: printed on the chart vs. structurally inherited. */
+  provenance: LegProvenance
+}
+
+/** One unrolled runway (grouped rows like "16L/R" arrive as separate entries). */
+export interface RunwayProcedure {
+  identifier: string
+  legs: ProcedureLeg[]
+}
+
+/**
+ * Pre-Phase 4 flat extraction shape. Retained only for reference while the
+ * geometry cascade is bypassed; no longer returned by /api/analyze.
+ */
 export interface ExtractionResult {
   extracted_value: string
   turn_direction: 'LEFT' | 'RIGHT' | 'NONE'
@@ -89,15 +125,16 @@ export interface Disambiguation {
   note: string
 }
 
+/**
+ * Phase 4 response: the validated multi-runway leg matrix, returned directly
+ * while the WGS-84 geometry cascade is bypassed. The geometry fields
+ * (triggerPoint, parametric, geojson, ...) return once the cascade is
+ * re-enabled per runway/leg.
+ */
 export interface AnalyzeResponse {
-  extraction: ExtractionResult
-  airacCycle: AiracCycle
-  /** Present when the LLM extracted a trigger_navaid_ident; null otherwise. */
-  triggerNavaid: TriggerNavaid | null
-  triggerPoint: TriggerPoint
-  parametric: Record<string, unknown>
-  geojson: FeatureCollection
-  disambiguation: Disambiguation | null
+  runways: RunwayProcedure[]
+  /** Stage-1 vision OCR markdown transcription, for matrix verification. */
+  transcription: string
 }
 
 export interface ApiErrorBody {
