@@ -36,7 +36,12 @@ services:
     environment:
       MONGODB_URI: mongodb://mongo:27017/emproview
       LLM_BASE_URL: http://llm:11434/v1
-      LLM_MODEL_NAME: phi3
+      LLM_MODEL_NAME: llama3:8b-instruct-q4_K_M
+      # Stage 1 of the dual-pass /api/analyze pipeline: chart image → raw
+      # procedure text via a vision-capable local model. qwen2.5vl replaces
+      # llama3.2-vision: its mllama architecture cannot load on current
+      # Ollama releases (support was dropped with the engine migration).
+      LLM_VISION_MODEL_NAME: qwen2.5vl:7b
       ENABLE_OCR: "false"
       # Pulled from the .env file next to this compose file; defaults to
       # "false" so production stacks never seed demo procedures by accident.
@@ -86,11 +91,12 @@ services:
   llm:
     image: ollama/ollama
     restart: unless-stopped
-    # Cap stays at 4g: phi3 fits; llama3 OOM-killed under this budget.
+    # 12g accommodates the dual-pass pair (llama3 8B q4 text + qwen2.5vl 7B
+    # vision) when Ollama spills past VRAM or falls back to CPU inference.
     # (Model weights live in GPU VRAM once the NVIDIA reservation below is
     # active, so this cap only bounds the host-side process memory.)
-    mem_limit: 4g
-    memswap_limit: 4g
+    mem_limit: 12g
+    memswap_limit: 12g
     # GPU passthrough: reserve one NVIDIA GPU so inference runs on hardware
     # instead of CPU (fixes the llama-server EOF crashes and slow evals).
     # Requires the NVIDIA container runtime on the Docker host.
@@ -117,15 +123,16 @@ services:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
-    # Start the server, ensure the model is present (no-op once the volume
-    # holds it), then keep serving.
+    # Start the server, ensure both dual-pass models are present (no-op once
+    # the volume holds them), then keep serving.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         ollama serve &
         SERVER_PID=$$!
         sleep 5
-        ollama pull phi3
+        ollama pull llama3:8b-instruct-q4_K_M
+        ollama pull qwen2.5vl:7b
         wait $$SERVER_PID
 
 volumes:

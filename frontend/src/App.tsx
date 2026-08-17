@@ -17,6 +17,9 @@ function App() {
   )
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [errorTranscription, setErrorTranscription] = useState<string | null>(
+    null,
+  )
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
 
   const handleFieldChange = (field: keyof AnalyzeRequest, value: string) => {
@@ -24,8 +27,19 @@ function App() {
   }
 
   const handleSubmit = async () => {
+    if (!formValues.image_base64) {
+      setError('Upload a procedure chart image before analyzing the path.')
+      return
+    }
+
+    if (!formValues.operator_id) {
+      setError('Select an operator before analyzing the path.')
+      return
+    }
+
     setLoading(true)
     setError(null)
+    setErrorTranscription(null)
 
     try {
       const response = await analyzeProcedure(formValues)
@@ -35,6 +49,7 @@ function App() {
 
       if (caught instanceof AnalyzeApiError) {
         setError(caught.message)
+        setErrorTranscription(caught.transcription)
       } else if (caught instanceof Error) {
         setError(caught.message)
       } else {
@@ -57,8 +72,18 @@ function App() {
       <main className="workspace">
         {error ? (
           <div className="status-banner error" role="alert">
-            <strong>Analysis failed.</strong>
-            <span>{error}</span>
+            <div className="error-message">
+              <strong>Analysis failed.</strong>
+              <span>{error}</span>
+            </div>
+            {errorTranscription ? (
+              <div className="error-transcription">
+                <span className="error-transcription-label">
+                  Vision OCR transcription
+                </span>
+                <pre>{errorTranscription}</pre>
+              </div>
+            ) : null}
           </div>
         ) : null}
 

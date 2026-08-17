@@ -1,7 +1,11 @@
 import type { FeatureCollection } from 'geojson'
 
 export interface AnalyzeRequest {
-  procedure_text: string
+  /**
+   * Base64-encoded procedure chart image (bare payload, no data-URL prefix).
+   * The backend runs vision OCR on it before semantic extraction.
+   */
+  image_base64: string
   extraction_target: string
   airportId: string
   runwayId: string
@@ -98,14 +102,19 @@ export interface AnalyzeResponse {
 
 export interface ApiErrorBody {
   error?: string
+  /** Stage-1 vision OCR transcription, echoed back on 422 rejections. */
+  transcription?: string
 }
 
 export class AnalyzeApiError extends Error {
   readonly status: number
+  /** Raw vision OCR text when the backend included it in the error body. */
+  readonly transcription: string | null
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, transcription: string | null = null) {
     super(message)
     this.name = 'AnalyzeApiError'
     this.status = status
+    this.transcription = transcription
   }
 }

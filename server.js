@@ -66,6 +66,14 @@ const OCR_ENABLED = process.env.ENABLE_OCR === "true";
 const LLM_EXTRACTION_OPTIONS = { num_ctx: 4096, temperature: 0.0 };
 const LLM_EXTRACTION_MAX_ATTEMPTS = 3;
 
+// Dual-pass vision settings (Stage 1 of /api/analyze): the uploaded chart
+// image is transcribed by a local vision-capable Ollama model, and only the
+// resulting raw text enters the deterministic JSON extraction loop above.
+// qwen2.5vl, not llama3.2-vision: mllama cannot load on current Ollama.
+// The prompt itself is built per-request (it names the target runway).
+const VISION_MODEL_NAME = process.env.LLM_VISION_MODEL_NAME || "qwen2.5vl:7b";
+const VISION_OCR_OPTIONS = { temperature: 0.0 };
+
 // VULNERABILITY #3 PATCH: The Memory Bomb
 // Enforce strict 5MB limit and reject non-image MIME types
 const upload = multer({ 
@@ -145,7 +153,9 @@ app.use(cors({
     allowedHeaders: ["Content-Type", "x-api-key", "Authorization"]
 }));
 
-app.use(express.json());
+// /api/analyze carries a base64 chart image inline (~6.7 MB for a 5 MB
+// image); express's 100 KB default body cap would reject every scan.
+app.use(express.json({ limit: "15mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 function requireAuth(req, res, next) {
@@ -481,9 +491,12 @@ function requireAnalyzeAuth(req, res, next) {
     return next();
 }
 
-// Bridges the extraction, ground-truth, and spatial calculation layers:
-//   Stage 1  LLM extraction of relational logic (local Ollama container,
-//            native /api/generate via the Docker service name http://llm:11434).
+// Bridges the vision, extraction, ground-truth, and spatial calculation layers:
+//   Stage 1  Vision OCR of the uploaded chart image (local Ollama container,
+//            native /api/generate via the Docker service name http://llm:11434,
+//            vision-capable model) — emits the raw procedure text.
+//   Stage 2  LLM extraction of relational logic from that text (same Ollama
+//            container, text model, bounded 3-attempt retry loop).
 //   Stage 3  Validated physical ground truth (groundTruthService) — AIRAC
 //            currency is enforced before any spatial query runs.
 //   Stage 4  Deterministic WGS-84 solving (GeoMath + PathGeometry).
@@ -491,7 +504,7 @@ function requireAnalyzeAuth(req, res, next) {
 // data rejects the computation with a 422 and the exact failure message.
 app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
     const {
-        procedure_text: procedureText,
+        image_base64: rawImageBase64,
         extraction_target: extractionTarget,
         airportId,
         runwayId,
@@ -500,7 +513,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
     } = req.body || {};
 
     const missing = [
-        ["procedure_text", procedureText],
+        ["image_base64", rawImageBase64],
         ["extraction_target", extractionTarget],
         ["airportId", airportId],
         ["runwayId", runwayId],
@@ -510,7 +523,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
     if (missing.length > 0) {
         return res.status(400).json({
             error: `Missing required fields: ${missing.join(", ")}. ` +
-                `procedure_text, extraction_target, airportId, runwayId, and navaidId must all be provided.`
+                `image_base64, extraction_target, airportId, runwayId, and navaidId must all be provided.`
         });
     }
 
@@ -527,6 +540,74 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
     }
 
     const operatorId = (rawOperatorId ?? PUBLIC_OPERATOR_ID).trim().toUpperCase();
+
+    // Browsers hand FileReader results back as data URLs; Ollama's native
+    // /api/generate expects the bare base64 payload.
+    const imageBase64 = rawImageBase64.replace(/^data:image\/[\w.+-]+;base64,/i, "").trim();
+
+    analyzeTrace("request_received", {
+        airportId,
+        runwayId,
+        navaidId,
+        operatorId,
+        extractionTarget,
+        imageBase64Chars: imageBase64.length
+    });
+
+    // Stage 1: vision OCR. One shot, no retry — a transcription failure is
+    // either an infrastructure fault (500) or an unreadable chart (422
+    // below); re-running the same image through the same weights at
+    // temperature 0 cannot produce a different outcome.
+    //
+    // Context-aware, verbatim prompt: naming the target runway anchors the
+    // model on the correct EFP block of a multi-runway chart, and the
+    // verbatim directive suppresses the summarization failure mode that
+    // silently dropped charted DME values from the transcription.
+    const visionPrompt = `You are an expert aeronautical data extractor.
+Locate and transcribe the Engine Failure Procedure (Special Engine-Out Departure / EFP) specifically for Runway ${runwayId || 'the specified runway'} from this chart.
+Transcribe verbatim, preserving every number, heading, altitude, waypoint name, and DME distance exactly as printed.
+Output only the raw textual procedure instructions with no preamble, summary, or commentary.`;
+
+    let procedureText;
+
+    try {
+        analyzeTrace("vision_request_start", { model: VISION_MODEL_NAME });
+        const visionResponse = await fetch("http://llm:11434/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                model: VISION_MODEL_NAME,
+                prompt: visionPrompt,
+                images: [imageBase64],
+                stream: false,
+                options: VISION_OCR_OPTIONS
+            }),
+            // Vision inference is markedly slower than text-only extraction;
+            // allow more headroom before declaring the container dead.
+            signal: AbortSignal.timeout(300_000)
+        });
+
+        if (!visionResponse.ok) {
+            throw new Error(`Ollama returned HTTP ${visionResponse.status} ${visionResponse.statusText}`);
+        }
+
+        procedureText = ((await visionResponse.json()).response || "").trim();
+        // Full transcription goes into the trace: extraction failures are
+        // undiagnosable without seeing exactly what the vision pass produced.
+        analyzeTrace("vision_response_ok", { chars: procedureText.length, transcription: procedureText });
+    } catch (error) {
+        analyzeTrace("vision_failed", { name: error.name, message: error.message });
+        console.error(`Vision OCR request failed (${error.name}): ${error.message}`);
+        return res.status(500).json({ error: "Vision OCR failed. The inference container did not return a transcription." });
+    }
+
+    if (procedureText === "") {
+        analyzeTrace("vision_empty_transcription", {});
+        return res.status(422).json({
+            error: "Vision OCR returned no procedure text. The uploaded chart image does not contain a readable Engine Failure Procedure.",
+            transcription: ""
+        });
+    }
 
     const prompt =
         `You are a precision aviation data extraction tool.\n` +
@@ -566,17 +647,8 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         `Do not include any conversational filler, markdown, code fences, labels, or explanation. ` +
         `Output the raw JSON object and nothing else.`;
 
-    analyzeTrace("request_received", {
-        airportId,
-        runwayId,
-        navaidId,
-        operatorId,
-        extractionTarget,
-        procedureTextChars: procedureText.length
-    });
-
     try {
-        // Stage 1: LLM extraction with a bounded retry loop. Each attempt is
+        // Stage 2: LLM extraction with a bounded retry loop. Each attempt is
         // a full round trip: Ollama call (format: "json", deterministic
         // options), then strict schema validation via parseRelationalLogic.
         // Malformed JSON or a schema violation (DataIntegrityError) retries
@@ -595,7 +667,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        model: process.env.LLM_MODEL_NAME || "phi3",
+                        model: process.env.LLM_MODEL_NAME || "llama3:8b-instruct-q4_K_M",
                         prompt,
                         stream: false,
                         format: "json",
@@ -775,10 +847,12 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
         });
     } catch (error) {
         analyzeTrace("pipeline_failed", { name: error.name, message: error.message });
+        // Every 422 carries the Stage-1 transcription: when downstream stages
+        // reject, the operator must see what the vision pass actually read.
         // AiracExpiredError subclasses DataIntegrityError: both are structural
         // rejections of the computation, never generic server faults.
         if (error instanceof DataIntegrityError) {
-            return res.status(422).json({ error: error.message });
+            return res.status(422).json({ error: error.message, transcription: procedureText });
         }
 
         // Circuit-breaker Errors ("Invalid distance calculated", "Infinite loop averted")
@@ -787,7 +861,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             error instanceof Error &&
             (error.message === "Invalid distance calculated" || error.message === "Infinite loop averted")
         ) {
-            return res.status(422).json({ error: error.message });
+            return res.status(422).json({ error: error.message, transcription: procedureText });
         }
 
         console.error(`Analyze pipeline failed (${error.name}): ${error.message}`);

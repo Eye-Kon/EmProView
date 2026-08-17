@@ -20,17 +20,27 @@ function getApiKey(): string {
   return apiKey
 }
 
-async function parseErrorMessage(response: Response): Promise<string> {
+async function parseErrorBody(
+  response: Response,
+): Promise<{ message: string; transcription: string | null }> {
   try {
     const body = (await response.json()) as ApiErrorBody
-    if (typeof body.error === 'string' && body.error.trim()) {
-      return body.error
-    }
-  } catch {
-    // Fall through to status-based message.
-  }
+    const message =
+      typeof body.error === 'string' && body.error.trim()
+        ? body.error
+        : `Request failed with status ${response.status}`
+    const transcription =
+      typeof body.transcription === 'string' && body.transcription.trim()
+        ? body.transcription
+        : null
 
-  return `Request failed with status ${response.status}`
+    return { message, transcription }
+  } catch {
+    return {
+      message: `Request failed with status ${response.status}`,
+      transcription: null,
+    }
+  }
 }
 
 export async function analyzeProcedure(
@@ -46,8 +56,8 @@ export async function analyzeProcedure(
   })
 
   if (!response.ok) {
-    const message = await parseErrorMessage(response)
-    throw new AnalyzeApiError(response.status, message)
+    const { message, transcription } = await parseErrorBody(response)
+    throw new AnalyzeApiError(response.status, message, transcription)
   }
 
   return (await response.json()) as AnalyzeResponse
