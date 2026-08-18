@@ -56,6 +56,7 @@ const {
     batchExtractUploadMiddleware,
     handleBatchExtract
 } = require("./backend/controllers/batchExtractController");
+const { createCompileCycleHandler } = require("./backend/controllers/cycleCompilerController");
 const {
     initOperatorProcedureRegistry,
     ensureOperatorProcedureRegistryIndexes,
@@ -452,6 +453,14 @@ app.post("/api/extract", requireAuth, async (req, res) => {
  * /api/verify. Distinct from /api/extract/batch (async JSON text queue).
  */
 app.post("/api/batch-extract", requireAuth, batchExtractUploadMiddleware, handleBatchExtract);
+
+/**
+ * Phase 7.0 multi-tenant cycle compiler. Compiles every ACTIVE registry
+ * lock for operator_id into one ARINC 424-18 pack stamped with airac_cycle
+ * (columns 129-132). Per-procedure encoder failures are isolated into
+ * rejection_manifest; the rest of the fleet still ships.
+ */
+app.post("/api/compile-cycle", requireAuth, createCompileCycleHandler(() => db));
 
 /**
  * Batch ingestion: accepts a JSON file upload (field "file") containing

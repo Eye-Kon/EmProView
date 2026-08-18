@@ -65,6 +65,22 @@ async function findRegistryEntry(identity) {
 }
 
 /**
+ * Fleet-wide ACTIVE lock set for one operator. Sort is stable so a cycle
+ * pack is byte-identical across recompiles of the same registry.
+ */
+async function listActiveRegistryEntries(operatorId) {
+    return getRegistryCollection()
+        .find({ operator_id: operatorId, status: "ACTIVE" })
+        .sort({
+            airport_icao: 1,
+            procedure_ident: 1,
+            route_type: 1,
+            transition: 1
+        })
+        .toArray();
+}
+
+/**
  * Locks the 5-part ident as ACTIVE. A RETIRED row is a hard reject —
  * the ident is reserved forever. Re-locking an already-ACTIVE key is
  * idempotent (same procedure republished / amended).
@@ -119,6 +135,7 @@ module.exports = {
     initOperatorProcedureRegistry,
     ensureOperatorProcedureRegistryIndexes,
     findRegistryEntry,
+    listActiveRegistryEntries,
     lockRegistryIdent,
     registryFilter
 };
