@@ -51,6 +51,22 @@ const {
 } = require("./backend/extractionService");
 const { initNavDb, ensureNavDataIndexes, determineActiveCycle, PUBLIC_OPERATOR_ID } = require("./utils/navDbQuery");
 const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExporter");
+const {
+    initOperatorProcedureRegistry,
+    ensureOperatorProcedureRegistryIndexes,
+    lockRegistryIdent
+} = require("./backend/models/operatorProcedureRegistry");
+const {
+    ProcedureIdentityError,
+    parseProcedureIdentity,
+    diffBoundFields,
+    buildAmendments,
+    preserveOcrProvenance,
+    stampIdentity,
+    ensureCanonicalProcedureIndexes,
+    findCanonicalProcedure,
+    upsertCanonicalProcedure
+} = require("./backend/models/canonicalProcedure");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -123,6 +139,9 @@ async function connectDB() {
         // Multi-tenant compound index ({operator_id, identifier, airportId})
         // must exist before operator-scoped queries serve traffic.
         ["ensureNavDataIndexes (nav_data multi-tenant index)", () => ensureNavDataIndexes()],
+        ["initOperatorProcedureRegistry (ARINC 424 ident lock)", () => initOperatorProcedureRegistry(db)],
+        ["ensureOperatorProcedureRegistryIndexes (5-part identity unique)", () => ensureOperatorProcedureRegistryIndexes()],
+        ["ensureCanonicalProcedureIndexes (drop runway lock, add identity unique)", () => ensureCanonicalProcedureIndexes(db)],
         // Demo seeding is a development convenience only: production
         // containers must start with an empty procedures collection.
         ["seedDatabase (demo data seeder)", async () => {
@@ -198,38 +217,31 @@ app.post("/api/verify", requireAuth, async (req, res) => {
     }
 
     let verifyFlightDate;
+    let identity;
 
     try {
         verifyFlightDate = parseFlightDate(incomingProcedure.flightDate);
+        identity = parseProcedureIdentity(incomingProcedure);
     } catch (error) {
-        return res.status(400).json({ error: error.message });
+        const status = error instanceof ProcedureIdentityError ? error.statusCode : 400;
+        return res.status(status).json({ error: error.message });
     }
 
     try {
-        const incomingAirportCode = getProcedureAirportCode(incomingProcedure);
-
-        if (incomingAirportCode === "UNKNOWN") {
-            return res.status(400).json({ error: "Invalid payload: airportCode is required." });
-        }
-
+        // Runways are transition attributes, not a uniqueness key. The
+        // legacy airport+runway 409 lock is gone; identity is the 5-part
+        // ARINC 424 key minted in OperatorProcedureRegistry.
         for (const incomingRow of incomingProcedure.procedureRows) {
             const incomingRunways = Array.isArray(incomingRow.runways) ? incomingRow.runways : [];
 
             if (incomingRunways.length === 0) {
                 return res.status(400).json({ error: "Invalid payload: each procedure row must include at least one runway." });
             }
-
-            const collision = await db.collection("procedures").findOne({
-                ...getAirportQuery(incomingAirportCode),
-                "procedureRows.runways": { $in: incomingRunways }
-            });
-
-            if (collision) {
-                return res.status(409).json({
-                    error: "Conflict: Procedure for this Airport/Runway already exists. Manual archiving required."
-                });
-            }
         }
+
+        const existingProcedure = await findCanonicalProcedure(db, identity);
+        const diffs = existingProcedure ? diffBoundFields(existingProcedure, incomingProcedure) : [];
+        const newAmendments = buildAmendments(diffs, incomingProcedure);
 
         const enrichedProcedure = await enrichProcedureWithSpatialTriggers(incomingProcedure, verifyFlightDate);
 
@@ -248,10 +260,44 @@ app.post("/api/verify", requireAuth, async (req, res) => {
             });
         }
 
-        await db.collection("procedures").insertOne(enrichedProcedure);
+        if (existingProcedure) {
+            preserveOcrProvenance(existingProcedure, enrichedProcedure);
+        }
 
-        return res.status(200).json({ ok: true });
+        const priorAmendments = Array.isArray(existingProcedure?.amendments)
+            ? existingProcedure.amendments
+            : [];
+
+        const document = stampIdentity(enrichedProcedure, identity);
+        document.amendments = [...priorAmendments, ...newAmendments];
+
+        await lockRegistryIdent(identity);
+
+        try {
+            await upsertCanonicalProcedure(db, identity, document);
+        } catch (error) {
+            if (error?.code === 11000) {
+                return res.status(409).json({
+                    error: "Conflict: a procedure is already locked to this 5-part ARINC 424 identity."
+                });
+            }
+            throw error;
+        }
+
+        return res.status(200).json({
+            ok: true,
+            identity,
+            amendmentCount: newAmendments.length
+        });
     } catch (error) {
+        if (error instanceof ProcedureIdentityError) {
+            return res.status(error.statusCode).json({ error: error.message });
+        }
+
+        if (error instanceof DataIntegrityError) {
+            return res.status(409).json({ error: error.message });
+        }
+
         console.error("Procedure verification failed:", error);
         return res.status(500).json({ error: "Failed to verify and save procedure." });
     }
