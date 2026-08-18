@@ -230,6 +230,51 @@ app.get("/api/procedures", async (req, res) => {
     }
 });
 
+/**
+ * Single-procedure lookup by operator + ident (optional airport / route /
+ * transition query params). Used by the HITL e2e provenance audit without
+ * dumping the whole procedures collection.
+ */
+app.get("/api/procedures/:operatorId/:procedureIdent", async (req, res) => {
+    try {
+        const operator_id = String(req.params.operatorId || "").trim().toUpperCase();
+        const procedure_ident = String(req.params.procedureIdent || "").trim().toUpperCase();
+
+        if (!operator_id || !procedure_ident) {
+            return res.status(400).json({ error: "operatorId and procedureIdent are required." });
+        }
+
+        const filter = { operator_id, procedure_ident };
+
+        if (typeof req.query.airport_icao === "string" && req.query.airport_icao.trim()) {
+            filter.airport_icao = req.query.airport_icao.trim().toUpperCase();
+        }
+
+        if (typeof req.query.route_type === "string" && req.query.route_type.trim()) {
+            filter.route_type = String(req.query.route_type).trim().toUpperCase();
+        }
+
+        if (typeof req.query.transition === "string" && req.query.transition.trim()) {
+            filter.transition = req.query.transition.trim().toUpperCase();
+        }
+
+        const procedures = await db.collection("procedures").find(filter).toArray();
+
+        if (procedures.length === 0) {
+            return res.status(404).json({ error: "Procedure not found." });
+        }
+
+        if (procedures.length === 1) {
+            return res.json({ procedure: procedures[0] });
+        }
+
+        return res.json({ count: procedures.length, procedures });
+    } catch (error) {
+        console.error("Failed to load procedure:", error);
+        return res.status(500).json({ error: "Failed to load procedure data." });
+    }
+});
+
 app.post("/api/verify", requireAuth, async (req, res) => {
     const incomingProcedure = req.body;
 
