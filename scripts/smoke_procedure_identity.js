@@ -11,6 +11,7 @@ const {
     parseProcedureIdentity,
     collectBoundFields,
     diffBoundFields,
+    requireHitlUserId,
     buildAmendments,
     preserveOcrProvenance,
     isLegacyRunwayLockIndex
@@ -125,6 +126,34 @@ function main() {
     );
     assert.ok(!Object.keys(fields).some((path) => /computedSpatialTrigger|latitude|longitude/.test(path)));
     console.log("  ok — 424-bound collector captures headings/DME and ignores coordinates");
+
+    const withTurnLeg = baseline();
+    withTurnLeg.procedureRows[0].legs = [{
+        type: "TURN_TO_HEADING",
+        value: 330,
+        targetMagneticHeading: 330,
+        direction: "LEFT",
+        navaid: null
+    }];
+    assert.strictEqual(
+        collectBoundFields(withTurnLeg)["procedureRows.0.legs.0.targetMagneticHeading"],
+        330
+    );
+    console.log("  ok — TURN_TO_HEADING targetMagneticHeading is a 424-bound field");
+
+    const firstLockDiffs = diffBoundFields({}, baseline());
+    assert.ok(firstLockDiffs.length > 0);
+    assert.throws(
+        () => requireHitlUserId(baseline()),
+        (error) => error instanceof ProcedureIdentityError && /user_id/.test(error.message),
+        "first lock without user_id must 400"
+    );
+    assert.throws(
+        () => buildAmendments(firstLockDiffs, { ...baseline(), user_id: "analyst.1" }),
+        (error) => error instanceof ProcedureIdentityError && /justification/.test(error.message),
+        "first lock without justification must 400"
+    );
+    console.log("  ok (rejected 400) — first publication is a HITL delta from empty");
 
     const incoming = baseline();
     incoming.procedureRows[0].assignedHeadingDegrees = 330;

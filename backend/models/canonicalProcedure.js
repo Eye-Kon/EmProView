@@ -36,7 +36,7 @@ const BOUND_TRIGGER_KEYS = [
 
 const BOUND_ACTION_KEYS = ["actionType", "turnDirection", "magneticHeading"];
 
-const BOUND_LEG_KEYS = ["type", "value", "navaid", "direction"];
+const BOUND_LEG_KEYS = ["type", "value", "navaid", "direction", "targetMagneticHeading"];
 
 const BOUND_ROW_KEYS = [
     "assignedHeadingDegrees",
@@ -256,6 +256,22 @@ function normalizeJustification(value) {
     return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
 }
 
+/**
+ * A human analyst must be on every /api/verify lock, including identical
+ * republish. Missing user_id is a 400 — the registry is never touched.
+ */
+function requireHitlUserId(payload) {
+    const userId = typeof payload?.user_id === "string" ? payload.user_id.trim() : "";
+
+    if (!userId) {
+        throw new ProcedureIdentityError(
+            "HITL publication rejected: user_id is required to lock or amend a 5-part ARINC 424 identity."
+        );
+    }
+
+    return userId;
+}
+
 function amendmentJustificationsByPath(payload) {
     const map = new Map();
     const incoming = Array.isArray(payload?.amendments) ? payload.amendments : [];
@@ -469,6 +485,7 @@ module.exports = {
     identityFilter,
     collectBoundFields,
     diffBoundFields,
+    requireHitlUserId,
     buildAmendments,
     preserveOcrProvenance,
     stampIdentity,

@@ -65,6 +65,7 @@ const {
     ProcedureIdentityError,
     parseProcedureIdentity,
     diffBoundFields,
+    requireHitlUserId,
     buildAmendments,
     preserveOcrProvenance,
     stampIdentity,
@@ -259,7 +260,10 @@ app.post("/api/verify", requireAuth, async (req, res) => {
         }
 
         const existingProcedure = await findCanonicalProcedure(db, identity);
-        const diffs = existingProcedure ? diffBoundFields(existingProcedure, incomingProcedure) : [];
+        // First publication is a 424-bound delta from empty: locking a new
+        // ident without user_id + justification used to skip the HITL gate.
+        const diffs = diffBoundFields(existingProcedure || {}, incomingProcedure);
+        requireHitlUserId(incomingProcedure);
         const newAmendments = buildAmendments(diffs, incomingProcedure);
 
         const enrichedProcedure = await enrichProcedureWithSpatialTriggers(incomingProcedure, verifyFlightDate);
@@ -290,7 +294,7 @@ app.post("/api/verify", requireAuth, async (req, res) => {
         const document = stampIdentity(enrichedProcedure, identity);
         document.amendments = [...priorAmendments, ...newAmendments];
 
-        await lockRegistryIdent(identity);
+        const registry = await lockRegistryIdent(identity);
 
         try {
             await upsertCanonicalProcedure(db, identity, document);
@@ -303,10 +307,14 @@ app.post("/api/verify", requireAuth, async (req, res) => {
             throw error;
         }
 
-        return res.status(200).json({
+        return res.status(existingProcedure ? 200 : 201).json({
             ok: true,
             identity,
-            amendmentCount: newAmendments.length
+            amendmentCount: newAmendments.length,
+            registry: {
+                status: registry.status,
+                ...identity
+            }
         });
     } catch (error) {
         if (error instanceof ProcedureIdentityError) {
