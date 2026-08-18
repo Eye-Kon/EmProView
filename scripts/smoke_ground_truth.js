@@ -42,6 +42,7 @@ function buildFixture(now) {
             latitude: 40.804012,
             longitude: -111.981478,
             trueHeading: 176.65,
+            elevation_ft: 4227,
             magneticVariation: 11.0
         },
         {
@@ -80,6 +81,7 @@ async function main() {
         assert.ok(Number.isFinite(truth.originRunway.threshold.latitude));
         assert.ok(Number.isFinite(truth.originRunway.threshold.longitude));
         assert.ok(Number.isFinite(truth.originRunway.trueHeading));
+        assert.ok(Number.isFinite(truth.originRunway.elevation_ft));
         assert.ok(Number.isFinite(truth.originRunway.magneticVariation));
         assert.ok(Number.isFinite(truth.navaid.coordinates.latitude));
         assert.ok(Number.isFinite(truth.navaid.coordinates.longitude));
@@ -89,6 +91,7 @@ async function main() {
 
         if (seeded) {
             // Disambiguation must have picked the near station and attached evidence.
+            assert.strictEqual(truth.originRunway.elevation_ft, 4227);
             assert.strictEqual(truth.navaid.name, "SALT LAKE CITY");
             assert.strictEqual(truth.disambiguation.candidateCount, 2);
             assert.ok(truth.disambiguation.selectedDistanceNM < truth.disambiguation.nextNearestDistanceNM);

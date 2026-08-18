@@ -419,7 +419,10 @@ async function resolveTriggerNavaid(identifier, airportReference, flightDate = n
 
 /**
  * Resolves a runway end using the ground truth of the AIRAC cycle effective
- * on the flight date.
+ * on the flight date. Validates latitude, longitude, trueHeading,
+ * elevation_ft (threshold, feet MSL), and magneticVariation as finite
+ * numbers. A found runway with a missing elevation_ft is a
+ * DataIntegrityError — never guessed, never defaulted to 0.
  *
  * @param {string} airportCode - ICAO id, e.g. "KSLC"
  * @param {string} runwayIdentifier - runway end, e.g. "16L"
@@ -449,6 +452,9 @@ async function getRunway(airportCode, runwayIdentifier, flightDate = new Date())
         latitude: requireFiniteNumber(runway.latitude, `${fieldPath}.latitude`),
         longitude: requireFiniteNumber(runway.longitude, `${fieldPath}.longitude`),
         trueHeading: requireFiniteNumber(runway.trueHeading, `${fieldPath}.trueHeading`),
+        // Threshold elevation (ft MSL). Hard gate: missing / null / non-finite
+        // is a DataIntegrityError — never guessed, never defaulted to 0.
+        elevation_ft: requireFiniteNumber(runway.elevation_ft, `${fieldPath}.elevation_ft`),
         magneticVariation: requireFiniteNumber(runway.magneticVariation, `${fieldPath}.magneticVariation`),
         airacCycle: activeCycle.ident
     };

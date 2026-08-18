@@ -1,15 +1,17 @@
 /**
- * Smoke test for the Phase 4.3 multi-leg WGS-84 geodesic solver
+ * Smoke test for the Phase 4.3/4.4 multi-leg WGS-84 geodesic solver
  * (backend/geo/MultiLegSolver.js).
  *
  * Pure unit test — no MongoDB, no Ollama. Ground truth is synthetic
- * (KCLT-like geometry). Asserts:
+ * (KCLT-like geometry, high-altitude threshold). Asserts:
  *   1. A full DME -> TURN -> ALTITUDE chain solves sequentially: each leg
  *      starts exactly where the previous one ended.
  *   2. Feature properties carry { runway, legType, provenance, role }.
  *   3. Provenance neutrality: an all-CHARTED and an all-ROWSPAN_INHERITED
  *      copy of the same legs produce IDENTICAL coordinates.
- *   4. Unresolvable stations and unanchored altitude legs reject with
+ *   4. TRACK_TO_ALTITUDE closes against the runway threshold elevation_ft
+ *      (6500 ft MSL), never a navaid elevation.
+ *   5. Unresolvable stations and a missing elevation_ft reject with
  *      DataIntegrityError (-> 422), never a silent default.
  *
  * Run: node scripts/smoke_multileg_solver.js
@@ -28,7 +30,12 @@ const { DataIntegrityError } = require("../backend/geo/DataIntegrityError");
 const ORIGIN = { latitude: 35.2271, longitude: -80.9431 };
 const DEPARTURE_TRUE_HEADING = 10;
 const MAGNETIC_VARIATION = -7; // 7W: True = Magnetic - 7
-const FIELD_ELEVATION_FT = 748;
+// Phase 4.4: Z-axis is the physical runway threshold, not a navaid.
+// 6500 ft MSL is a high-altitude airport so the climb delta is unambiguous.
+const THRESHOLD_ELEVATION_FT = 6500;
+const TARGET_ALTITUDE_FT = 10000;
+// High enough that the DME+turn accrual from 6500 ft still leaves a remainder.
+const CHAIN_TARGET_ALTITUDE_FT = 20000;
 const STATIONS = {
     TCH: {
         identifier: "TCH",
@@ -41,7 +48,7 @@ function legChain(provenance) {
     return [
         { type: "TRACK_TO_DME", value: 11.6, navaid: "TCH", direction: null, provenance },
         { type: "TURN_TO_HEADING", value: 90, navaid: null, direction: "RIGHT", provenance },
-        { type: "TRACK_TO_ALTITUDE", value: 10000, navaid: null, direction: null, provenance }
+        { type: "TRACK_TO_ALTITUDE", value: CHAIN_TARGET_ALTITUDE_FT, navaid: null, direction: null, provenance }
     ];
 }
 
@@ -51,7 +58,7 @@ function solve(legs, overrides = {}) {
         origin: ORIGIN,
         departureTrueHeading: DEPARTURE_TRUE_HEADING,
         magneticVariation: MAGNETIC_VARIATION,
-        startElevationFtMsl: FIELD_ELEVATION_FT,
+        elevation_ft: THRESHOLD_ELEVATION_FT,
         legs,
         stationsByIdent: STATIONS,
         defaultStation: DEFAULT_STATION,
@@ -101,13 +108,14 @@ function main() {
     // nominal gradient, then the altitude leg covers exactly the remainder.
     // startAltitudeFtMsl is rounded to whole feet in the parametric record,
     // so allow the recomputed distance a rounding tolerance.
-    const expectedDistance = (10000 - climbLeg.climb.startAltitudeFtMsl) / DEFAULT_CLIMB_GRADIENT_FT_PER_NM;
+    const expectedDistance = (CHAIN_TARGET_ALTITUDE_FT - climbLeg.climb.startAltitudeFtMsl) / DEFAULT_CLIMB_GRADIENT_FT_PER_NM;
     assert.ok(
         Math.abs(climbLeg.climb.distanceNM - expectedDistance) < 0.005,
         "climb distance must close the altitude gap at the gradient"
     );
-    assert.strictEqual(solved.parametric.finalAltitudeFtMsl, 10000);
-    console.log(`  ok — climb profile closes to 10000 ft MSL over ${climbLeg.climb.distanceNM} NM`);
+    assert.strictEqual(solved.parametric.originElevationFtMsl, THRESHOLD_ELEVATION_FT);
+    assert.strictEqual(solved.parametric.finalAltitudeFtMsl, CHAIN_TARGET_ALTITUDE_FT);
+    console.log(`  ok — climb profile closes to ${CHAIN_TARGET_ALTITUDE_FT} ft MSL over ${climbLeg.climb.distanceNM} NM`);
 
     // Feature property contract for frontend styling.
     for (const feature of solved.features) {
@@ -144,6 +152,30 @@ function main() {
     assert.strictEqual(shortestTurn.directionSource, "shortest_turn");
     console.log("  ok — undirected turn resolves via shortest-turn (-77° left)");
 
+    console.log("THRESHOLD ELEVATION ANCHOR");
+
+    // Isolated TRACK_TO_ALTITUDE: climb delta is exactly
+    // (target MSL − threshold elevation_ft) / gradient. Stations carry no
+    // elevation field, so a pass here proves the navaid is not the Z-axis.
+    assert.strictEqual(STATIONS.TCH.elevation, undefined);
+    assert.strictEqual(STATIONS.TCH.elevationFtMsl, undefined);
+    const expectedClimbNM = Number(
+        ((TARGET_ALTITUDE_FT - THRESHOLD_ELEVATION_FT) / DEFAULT_CLIMB_GRADIENT_FT_PER_NM).toFixed(3)
+    );
+    const highAlt = solve([
+        { type: "TRACK_TO_ALTITUDE", value: TARGET_ALTITUDE_FT, navaid: null, direction: null, provenance: "CHARTED" }
+    ]);
+    const climb = highAlt.parametric.legs[0].climb;
+    assert.strictEqual(highAlt.parametric.originElevationFtMsl, THRESHOLD_ELEVATION_FT);
+    assert.strictEqual(climb.startAltitudeFtMsl, THRESHOLD_ELEVATION_FT);
+    assert.strictEqual(climb.targetAltitudeFtMsl, TARGET_ALTITUDE_FT);
+    assert.strictEqual(climb.distanceNM, expectedClimbNM);
+    assert.strictEqual(highAlt.parametric.finalAltitudeFtMsl, TARGET_ALTITUDE_FT);
+    console.log(
+        `  ok — climb from threshold ${THRESHOLD_ELEVATION_FT} ft to ${TARGET_ALTITUDE_FT} ft ` +
+            `is ${expectedClimbNM} NM (navaid elevation unused)`
+    );
+
     console.log("FALLBACK DME STATION");
 
     // A DME leg with no charted station uses the payload navaid.
@@ -163,12 +195,12 @@ function main() {
 
     assert.throws(
         () => solve(
-            [{ type: "TRACK_TO_ALTITUDE", value: 10000, navaid: null, direction: null, provenance: "CHARTED" }],
-            { startElevationFtMsl: null }
+            [{ type: "TRACK_TO_ALTITUDE", value: TARGET_ALTITUDE_FT, navaid: null, direction: null, provenance: "CHARTED" }],
+            { elevation_ft: null }
         ),
-        (error) => error instanceof DataIntegrityError && /no field elevation reference/.test(error.message)
+        (error) => error instanceof DataIntegrityError && /elevation_ft/.test(error.message)
     );
-    console.log("  ok (rejected 422) — altitude leg with no climb-profile anchor");
+    console.log("  ok (rejected 422) — missing runway threshold elevation_ft");
 
     console.log("\nAll multi-leg solver smoke checks passed.");
 }

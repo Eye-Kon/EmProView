@@ -96,6 +96,8 @@ export interface SolvedLeg {
 export interface RunwayParametricPath {
   runway: string
   origin: LatLng
+  /** Runway threshold elevation (ft MSL) — the Z-axis climb origin. */
+  originElevationFtMsl: number
   departureTrueHeading: number
   finalTrueHeading: number
   totalDistanceNM: number

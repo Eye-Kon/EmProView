@@ -24,14 +24,15 @@
  * Inputs inside the zip (FAA CSV subscription naming, matched
  * case-insensitively anywhere in the archive):
  *   APT_BASE.csv     airport ICAO ids + airport magnetic variation
- *   APT_RWY_END.csv  runway-end coordinates + TRUE_ALIGNMENT
+ *   APT_RWY_END.csv  runway-end coordinates + TRUE_ALIGNMENT + RWY_END_ELEV
  *   NAV_BASE.csv     navaid coordinates + magnetic variation
  *
  * Data integrity: a record without a finite WGS-84 coordinate is dropped
  * and counted — never coerced to zeros. Runway ends additionally require
- * a finite True Heading and airport Magnetic Variation, and navaids a
- * finite Magnetic Variation, because utils/navDbQuery.js fail-safes on
- * those fields at query time.
+ * a finite True Heading, a finite threshold elevation (RWY_END_ELEV, stored
+ * as elevation_ft), and airport Magnetic Variation, and navaids a finite
+ * Magnetic Variation, because utils/navDbQuery.js fail-safes on those
+ * fields at query time. Elevation is never defaulted to 0.
  *
  * AIRAC tagging: the cycle is derived from the data's own EFF_DATE column
  * (falling back to the current UTC date), via utils/airac.js. Every
@@ -273,9 +274,12 @@ async function streamRunwayEnds(entry, state, collection) {
         const latitude = coordinate(row, "LAT");
         const longitude = coordinate(row, "LONG");
         const trueHeading = finiteNumber(row.TRUE_ALIGNMENT);
+        // Physical runway-end elevation, feet MSL (FAA APT_RWY_END.RWY_END_ELEV).
+        // Stored as elevation_ft. Missing/non-finite is a drop, never 0.
+        const elevationFt = finiteNumber(row.RWY_END_ELEV);
 
         if (!airport || !runwayId || latitude === null || longitude === null ||
-            trueHeading === null || airport.magneticVariation === null) {
+            trueHeading === null || elevationFt === null || airport.magneticVariation === null) {
             state.stats.runwaysDropped += 1;
             continue;
         }
@@ -290,6 +294,7 @@ async function streamRunwayEnds(entry, state, collection) {
             latitude,
             longitude,
             trueHeading,
+            elevation_ft: elevationFt,
             magneticVariation: airport.magneticVariation
         });
         state.stats.runways += 1;

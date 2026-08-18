@@ -37,7 +37,7 @@ const EFF_DATE = "2026/06/11"; // AIRAC 2606 boundary within the current window
 
 function buildZip(zipPath) {
     const aptBase = ["EFF_DATE,SITE_NO,ARPT_ID,ICAO_ID,MAG_VARN,MAG_HEMIS"];
-    const rwyEnd = ["EFF_DATE,SITE_NO,ARPT_ID,RWY_END_ID,LAT_DECIMAL,LONG_DECIMAL,LAT_DEG,LAT_MIN,LAT_SEC,LAT_HEMIS,LONG_DEG,LONG_MIN,LONG_SEC,LONG_HEMIS,TRUE_ALIGNMENT"];
+    const rwyEnd = ["EFF_DATE,SITE_NO,ARPT_ID,RWY_END_ID,LAT_DECIMAL,LONG_DECIMAL,LAT_DEG,LAT_MIN,LAT_SEC,LAT_HEMIS,LONG_DEG,LONG_MIN,LONG_SEC,LONG_HEMIS,TRUE_ALIGNMENT,RWY_END_ELEV"];
     const navBase = ["EFF_DATE,NAV_ID,NAV_TYPE,NAME,STATE_CODE,LAT_DECIMAL,LONG_DECIMAL,MAG_VARN,MAG_VARN_HEMIS"];
 
     // 1,170 synthetic ICAO airports x 2 runway ends = 2,340 clean runway rows.
@@ -49,20 +49,21 @@ function buildZip(zipPath) {
 
         const lat = (30 + (i % 20) + 0.123).toFixed(6);
         const lon = (-(80 + (i % 40)) - 0.456).toFixed(6);
-        rwyEnd.push(`${EFF_DATE},${site},${arpt},18,${lat},${lon},,,,,,,,,184`);
-        rwyEnd.push(`${EFF_DATE},${site},${arpt},36,${lat},${lon},,,,,,,,,4`);
+        rwyEnd.push(`${EFF_DATE},${site},${arpt},18,${lat},${lon},,,,,,,,,184,4227`);
+        rwyEnd.push(`${EFF_DATE},${site},${arpt},36,${lat},${lon},,,,,,,,,4,4227`);
     }
 
     // DMS-columns-only runway end (no LAT_DECIMAL): must parse via DEG/MIN/SEC.
     aptBase.push(`${EFF_DATE},99999.*A,DMS,KDMS,8,W`);
-    rwyEnd.push(`${EFF_DATE},99999.*A,DMS,09,,,38,51,7.5,N,104,42,29.1,W,92`);
+    rwyEnd.push(`${EFF_DATE},99999.*A,DMS,09,,,38,51,7.5,N,104,42,29.1,W,92,6187`);
 
     // Dirty rows that MUST be dropped, never zero-coerced:
-    rwyEnd.push(`${EFF_DATE},10000.*A,X000,27,,,,,,,,,,,270`);           // no coordinates at all
-    rwyEnd.push(`${EFF_DATE},10000.*A,X000,09,33.1,-101.2,,,,,,,,,`);    // no true heading
-    rwyEnd.push(`${EFF_DATE},55555.*A,NOPE,18,33.1,-101.2,,,,,,,,,180`); // unknown airport (no join)
-    aptBase.push(`${EFF_DATE},88888.*A,NOMV,KNMV,,`);                    // airport without mag var
-    rwyEnd.push(`${EFF_DATE},88888.*A,NOMV,18,33.1,-101.2,,,,,,,,,180`); // -> dropped
+    rwyEnd.push(`${EFF_DATE},10000.*A,X000,27,,,,,,,,,,,270,100`);           // no coordinates at all
+    rwyEnd.push(`${EFF_DATE},10000.*A,X000,09,33.1,-101.2,,,,,,,,,`);        // no true heading
+    rwyEnd.push(`${EFF_DATE},10000.*A,X000,36,33.1,-101.2,,,,,,,,,180`);     // no threshold elevation
+    rwyEnd.push(`${EFF_DATE},55555.*A,NOPE,18,33.1,-101.2,,,,,,,,,180,100`); // unknown airport (no join)
+    aptBase.push(`${EFF_DATE},88888.*A,NOMV,KNMV,,`);                        // airport without mag var
+    rwyEnd.push(`${EFF_DATE},88888.*A,NOMV,18,33.1,-101.2,,,,,,,,,180,100`); // -> dropped
 
     // Navaids: 3 clean, one duplicated ident, 2 dirty (dropped).
     navBase.push(`${EFF_DATE},ICT,VORTAC,WICHITA,KS,37.746,-97.583,5,E`);
@@ -179,7 +180,7 @@ async function main() {
     check("meta doc committed last", calls.insertOne.length === 1 && calls.insertOne[0]._id === `airac_${airacCycle}`);
 
     check("runway count: 2340 clean + 1 DMS row", runways.length === 2341, `got ${runways.length}`);
-    check("dirty runway rows dropped (4)", stats.runwaysDropped === 4, `got ${stats.runwaysDropped}`);
+    check("dirty runway rows dropped (5)", stats.runwaysDropped === 5, `got ${stats.runwaysDropped}`);
     check("insertMany batches never exceed BATCH_SIZE",
         calls.insertMany.length >= 3 && calls.insertMany.every((size) => size <= BATCH_SIZE),
         `sizes: ${calls.insertMany.join(",")}`);
@@ -187,11 +188,17 @@ async function main() {
     const dms = runways.find((doc) => doc.key === "KDMS_09");
     check("DMS-columns fallback parsed", dms &&
         Math.abs(dms.latitude - 38.852083) < 1e-5 && Math.abs(dms.longitude + 104.708083) < 1e-5 &&
-        dms.trueHeading === 92 && dms.magneticVariation === -8,
+        dms.trueHeading === 92 && dms.magneticVariation === -8 && dms.elevation_ft === 6187,
         JSON.stringify(dms ?? null));
+
+    const firstRwy = runways.find((doc) => doc.key && doc.key.endsWith("_18") && doc.elevation_ft === 4227);
+    check("threshold elevation_ft ingested from RWY_END_ELEV", firstRwy && typeof firstRwy.elevation_ft === "number",
+        JSON.stringify(firstRwy ?? null));
 
     const zeroCoerced = runways.some((doc) => doc.latitude === 0 || doc.longitude === 0 || doc.trueHeading === null);
     check("no zero-coerced physical data", !zeroCoerced);
+    check("every runway has a finite elevation_ft",
+        runways.every((doc) => typeof doc.elevation_ft === "number" && Number.isFinite(doc.elevation_ft)));
 
     check("navaid idents: 2 docs (ICT, TCH; dirty rows gone)", navaids.length === 2, `got ${navaids.length}`);
     const tch = navaids.find((doc) => doc.identifier === "TCH");

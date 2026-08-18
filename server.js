@@ -891,6 +891,7 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
                 threshold: groundTruth.originRunway.threshold,
                 trueHeading: groundTruth.originRunway.trueHeading,
                 magneticVariation: groundTruth.magneticVariation,
+                elevation_ft: groundTruth.originRunway.elevation_ft,
                 legNavaids: Object.fromEntries(
                     Object.entries(groundTruth.legNavaids).map(([ident, station]) => [ident, {
                         type: station.type,
@@ -901,30 +902,20 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
                 )
             });
 
-            // Climb-profile anchor for TRACK_TO_ALTITUDE legs: the validated
-            // MSL elevation of a resolved terminal station at the airport
-            // (a terminal DME sits on the field), else any resolved leg
-            // station. Runways whose legs never trigger on altitude do not
-            // need one; the solver enforces this per leg.
-            const resolvedStations = Object.values(groundTruth.legNavaids);
-            const terminalStation = resolvedStations.find((station) => station.selection.tier === "terminal");
-            const elevationSource = terminalStation ?? resolvedStations[0] ?? null;
-            const startElevationFtMsl = Number.isFinite(elevationSource?.elevationFtMsl)
-                ? elevationSource.elevationFtMsl
-                : null;
-
             // Stage 4: deterministic WGS-84 multi-leg solving. The solver
             // walks the leg chain sequentially — each leg starts where the
             // previous one ended, on the heading the previous one rolled
-            // out on. Provenance (CHARTED vs ROWSPAN_INHERITED) rides along
-            // as UI metadata only; the vector math is identical.
+            // out on. The Z-axis cursor is the runway threshold elevation
+            // (elevation_ft), never a navaid elevation. Provenance
+            // (CHARTED vs ROWSPAN_INHERITED) rides along as UI metadata
+            // only; the vector math is identical.
             analyzeTrace("path_solve_start", { runway: runway.identifier, legCount: runway.legs.length });
             const solved = solveRunwayEscapePath({
                 runwayId: groundTruth.originRunway.runwayId,
                 origin: groundTruth.originRunway.threshold,
                 departureTrueHeading: groundTruth.originRunway.trueHeading,
                 magneticVariation: groundTruth.magneticVariation,
-                startElevationFtMsl,
+                elevation_ft: groundTruth.originRunway.elevation_ft,
                 legs: runway.legs,
                 stationsByIdent: groundTruth.legNavaids,
                 defaultStation: {

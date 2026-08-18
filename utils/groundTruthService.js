@@ -10,9 +10,10 @@
  *      AiracExpiredError is thrown and resolution terminates immediately —
  *      no geometry is ever computed from stale or not-yet-effective data.
  *   2. Runway threshold: exact WGS-84 threshold coordinates, True Heading,
- *      and Magnetic Variation for the requested runway end. Any missing or
- *      non-finite physical field throws DataIntegrityError naming the exact
- *      database field that failed. Nothing is ever coerced to zero.
+ *      Magnetic Variation, and threshold elevation (elevation_ft, feet MSL)
+ *      for the requested runway end. Any missing or non-finite physical
+ *      field throws DataIntegrityError naming the exact database field that
+ *      failed. Nothing is ever coerced to zero — including elevation.
  *   3. Navaid spatial disambiguation: navaid idents are not globally unique
  *      in the NAS. Duplicated idents are resolved deterministically to the
  *      candidate nearest (great-circle) to the runway threshold resolved in
@@ -81,8 +82,8 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
     const airacCycle = await navDb.determineActiveCycle(currentUtcTime);
 
     // 2. Runway threshold. getRunway validates latitude, longitude,
-    //    trueHeading, and magneticVariation as finite numbers, throwing
-    //    DataIntegrityError with the offending field path otherwise.
+    //    trueHeading, elevation_ft, and magneticVariation as finite numbers,
+    //    throwing DataIntegrityError with the offending field path otherwise.
     const runway = await navDb.getRunway(airportId, runwayId, currentUtcTime);
 
     // 3. Navaid, spatially disambiguated against the threshold from step 2.
@@ -207,7 +208,8 @@ async function resolvePhysicalGroundTruth(airportId, runwayId, navaidId, current
                 longitude: runway.longitude
             },
             trueHeading: runway.trueHeading,
-            magneticVariation: runway.magneticVariation
+            magneticVariation: runway.magneticVariation,
+            elevation_ft: runway.elevation_ft
         },
         navaid: {
             identifier: navaid.identifier,

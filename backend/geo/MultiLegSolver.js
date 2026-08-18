@@ -21,8 +21,10 @@
  * each feature's properties for UI styling and is never read by the solver.
  *
  * The climb profile is a nominal display model, not aircraft performance:
- * altitude accrues at DEFAULT_CLIMB_GRADIENT_FT_PER_NM over every NM flown
- * (straight legs and turn arc length alike). The turn radius derives from a
+ * the Z-axis cursor is initialized to the runway threshold elevation
+ * (elevation_ft) and then accrues at DEFAULT_CLIMB_GRADIENT_FT_PER_NM over
+ * every NM flown (straight legs and turn arc length alike). Navaid
+ * elevation is never an altitude input. The turn radius derives from a
  * standard 25° bank at a nominal engine-out climb TAS — declared in the
  * parametric record as radiusSource "standard_bank_nominal_tas", never a
  * flyability guarantee.
@@ -100,16 +102,14 @@ function pointFeature(coords, properties) {
 }
 
 /**
- * Advances the geodetic cursor by a flown distance: cumulative distance
- * always accrues; altitude accrues only when an elevation reference exists
- * (finite start altitude), at the nominal climb gradient.
+ * Advances the geodetic cursor by a flown distance. Distance and altitude
+ * both accrue: altitude from the threshold-anchored Z-axis at the nominal
+ * climb gradient. The cursor is guaranteed to have a finite altitude
+ * because solveRunwayEscapePath hard-gates elevation_ft at entry.
  */
 function advanceCursor(cursor, distanceNM) {
     cursor.distanceFlownNM += distanceNM;
-
-    if (Number.isFinite(cursor.altitudeFtMsl)) {
-        cursor.altitudeFtMsl += distanceNM * DEFAULT_CLIMB_GRADIENT_FT_PER_NM;
-    }
+    cursor.altitudeFtMsl += distanceNM * DEFAULT_CLIMB_GRADIENT_FT_PER_NM;
 }
 
 /**
@@ -120,8 +120,9 @@ function advanceCursor(cursor, distanceNM) {
  * @param {{latitude:number,longitude:number}} params.origin - runway threshold (WGS-84)
  * @param {number} params.departureTrueHeading - runway True heading, degrees
  * @param {number} params.magneticVariation - degrees East-positive, from the runway record
- * @param {number|null} params.startElevationFtMsl - climb-profile anchor (ft MSL);
- *   null is allowed unless the sequence contains a TRACK_TO_ALTITUDE leg
+ * @param {number} params.elevation_ft - runway threshold elevation, feet MSL.
+ *   Required and finite. This is the only Z-axis origin; navaid elevation
+ *   is never consulted.
  * @param {Array} params.legs - validated legs from parseRunwayMatrix
  * @param {object} params.stationsByIdent - { IDENT: { identifier, coordinates:{latitude,longitude} } }
  *   for every navaid ident referenced by a leg
@@ -135,16 +136,23 @@ function solveRunwayEscapePath({
     origin,
     departureTrueHeading,
     magneticVariation,
-    startElevationFtMsl,
+    elevation_ft,
     legs,
     stationsByIdent,
     defaultStation
 }) {
+    if (typeof elevation_ft !== "number" || !Number.isFinite(elevation_ft)) {
+        throw new DataIntegrityError(
+            `Runway ${runwayId}: elevation_ft (runway threshold elevation, feet MSL) must be a finite number. ` +
+                `Missing, null, or non-finite values are rejected — the climb profile is never anchored on a navaid.`
+        );
+    }
+
     const cursor = {
         position: { latitude: origin.latitude, longitude: origin.longitude },
         trueHeading: GeoMath.normalizeBearing(departureTrueHeading),
         distanceFlownNM: 0,
-        altitudeFtMsl: Number.isFinite(startElevationFtMsl) ? startElevationFtMsl : null
+        altitudeFtMsl: elevation_ft
     };
 
     const features = [];
@@ -297,16 +305,10 @@ function solveRunwayEscapePath({
         }
 
         if (leg.type === "TRACK_TO_ALTITUDE") {
-            if (!Number.isFinite(cursor.altitudeFtMsl)) {
-                throw new DataIntegrityError(
-                    `Runway ${runwayId} leg ${index} (TRACK_TO_ALTITUDE): no field elevation reference is ` +
-                        `available to anchor the climb profile. A terminal station with a validated MSL ` +
-                        `elevation must resolve at this airport before altitude triggers can be solved.`
-                );
-            }
-
-            // Altitude already satisfied earlier in the profile collapses to a
-            // zero-length leg at the cursor ("at or above" semantics).
+            // Z-axis is the threshold-anchored cursor: climb remaining is
+            // target MSL minus altitude accrued from elevation_ft. Altitude
+            // already satisfied earlier collapses to a zero-length leg
+            // ("at or above" semantics).
             const remainingFt = Math.max(leg.value - cursor.altitudeFtMsl, 0);
             const climbDistanceNM = Number((remainingFt / DEFAULT_CLIMB_GRADIENT_FT_PER_NM).toFixed(3));
             const capturePoint = climbDistanceNM > 0
@@ -348,6 +350,7 @@ function solveRunwayEscapePath({
         parametric: {
             runway: runwayId,
             origin,
+            originElevationFtMsl: elevation_ft,
             departureTrueHeading: GeoMath.normalizeBearing(departureTrueHeading),
             finalTrueHeading: cursor.trueHeading,
             totalDistanceNM: Number(cursor.distanceFlownNM.toFixed(2)),
