@@ -53,6 +53,10 @@ const { initNavDb, ensureNavDataIndexes, determineActiveCycle, PUBLIC_OPERATOR_I
 const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExporter");
 const { generateArinc424File } = require("./services/arinc424Exporter");
 const {
+    batchExtractUploadMiddleware,
+    handleBatchExtract
+} = require("./backend/controllers/batchExtractController");
+const {
     initOperatorProcedureRegistry,
     ensureOperatorProcedureRegistryIndexes,
     lockRegistryIdent
@@ -432,6 +436,14 @@ app.post("/api/extract", requireAuth, async (req, res) => {
         return res.status(500).json({ error: "Failed to extract procedure data" });
     }
 });
+
+/**
+ * Phase 6 synchronous bulk chart ingestion. Multipart files[] + operator_id.
+ * Extraction only: OCR/LLM per file with isolated failures; no nav_data
+ * insert and no OperatorProcedureRegistry lock. HITL still goes through
+ * /api/verify. Distinct from /api/extract/batch (async JSON text queue).
+ */
+app.post("/api/batch-extract", requireAuth, batchExtractUploadMiddleware, handleBatchExtract);
 
 /**
  * Batch ingestion: accepts a JSON file upload (field "file") containing
