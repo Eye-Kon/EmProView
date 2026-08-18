@@ -404,7 +404,18 @@ function isLegacyRunwayLockIndex(index) {
  */
 async function ensureCanonicalProcedureIndexes(db) {
     const collection = db.collection(PROCEDURES_COLLECTION);
-    const existing = await collection.indexes();
+    let existing = [];
+
+    try {
+        existing = await collection.indexes();
+    } catch (error) {
+        // Empty tenant: no procedures collection yet. createIndex below
+        // creates it. Listing indexes on a missing namespace is not a
+        // governance failure.
+        if (error?.code !== 26 && error?.codeName !== "NamespaceNotFound") {
+            throw error;
+        }
+    }
 
     for (const index of existing) {
         if (index.name === "_id_" || index.name === PROCEDURE_IDENTITY_INDEX_NAME) {

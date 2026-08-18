@@ -36,7 +36,7 @@ function analyzeTrace(stage, details = {}) {
 }
 const { AiracExpiredError, DataIntegrityError } = require("./backend/geo_engine");
 const { solveRunwayEscapePath } = require("./backend/geo/MultiLegSolver");
-const { parseRunwayMatrix } = require("./backend/extraction/parseRunwayMatrix");
+const { parseRunwayMatrix, propagateMatrixNavaids } = require("./backend/extraction/parseRunwayMatrix");
 const { buildProvenanceGrid } = require("./backend/extraction/tier2Classifier");
 const { resolvePhysicalGroundTruth } = require("./utils/groundTruthService");
 const { initNasrUpdater } = require("./backend/jobs/nasrUpdater");
@@ -51,6 +51,7 @@ const {
 } = require("./backend/extractionService");
 const { initNavDb, ensureNavDataIndexes, determineActiveCycle, PUBLIC_OPERATOR_ID } = require("./utils/navDbQuery");
 const { generateAixmRoute, UnserializableRouteError } = require("./utils/aixmExporter");
+const { generateArinc424File } = require("./services/arinc424Exporter");
 const {
     initOperatorProcedureRegistry,
     ensureOperatorProcedureRegistryIndexes,
@@ -199,11 +200,25 @@ app.get("/api/health", (req, res) => {
 app.get("/api/procedures", async (req, res) => {
     try {
         const savedProcedures = await db.collection("procedures").find({}).toArray();
+
+        if (req.query.format === "arinc424") {
+            const flightDate = new Date();
+            const airacCycle = await determineActiveCycle(flightDate);
+            const locked = savedProcedures.filter((procedure) => procedure.procedure_ident);
+            const pack = await generateArinc424File(locked, { airacCycle, flightDate });
+
+            return res.type("text/plain").send(pack);
+        }
+
         return res.json({
             count: savedProcedures.length,
             procedures: savedProcedures
         });
     } catch (error) {
+        if (error instanceof DataIntegrityError || error instanceof AiracExpiredError) {
+            return res.status(422).json({ error: error.message });
+        }
+
         console.error("Failed to load procedures:", error);
         return res.status(500).json({ error: "Failed to load procedure data." });
     }
@@ -368,11 +383,48 @@ app.post("/api/extract", requireAuth, async (req, res) => {
             return res.type("application/xml").send(aixmXml);
         }
 
+        // ARINC 424-18 is emitted only from the locked verification library,
+        // never from an unverified extract preview.
+        if (req.query.format === "arinc424") {
+            let identity;
+
+            try {
+                identity = parseProcedureIdentity(enrichedProcedure);
+            } catch (error) {
+                return res.status(422).json({
+                    error: "ARINC 424 serialization requires a locked verified procedure. " +
+                        "Publish via /api/verify, then GET /api/procedures?format=arinc424."
+                });
+            }
+
+            const locked = await findCanonicalProcedure(db, identity);
+
+            if (!locked) {
+                return res.status(422).json({
+                    error: "ARINC 424 serialization requires a locked verified procedure. " +
+                        "Publish via /api/verify, then GET /api/procedures?format=arinc424."
+                });
+            }
+
+            const resolvedFlightDate = flightDate ?? new Date();
+            const airacCycle = await determineActiveCycle(resolvedFlightDate);
+            const pack = await generateArinc424File(locked, {
+                airacCycle,
+                flightDate: resolvedFlightDate
+            });
+
+            return res.type("text/plain").send(pack);
+        }
+
         return res.json(enrichedProcedure);
     } catch (error) {
         // AIXM failsafe: unverified routes and uncovered flight dates are
         // client errors (the route cannot be serialized), not server faults.
-        if (error instanceof UnserializableRouteError || error instanceof AiracExpiredError) {
+        if (
+            error instanceof UnserializableRouteError ||
+            error instanceof AiracExpiredError ||
+            error instanceof DataIntegrityError
+        ) {
             return res.status(422).json({ error: error.message });
         }
 
@@ -818,7 +870,9 @@ app.post("/api/analyze", requireAnalyzeAuth, async (req, res) => {
             }
 
             try {
-                parsedMatrix = parseRunwayMatrix(rawLlmResponse);
+                parsedMatrix = propagateMatrixNavaids(parseRunwayMatrix(rawLlmResponse), {
+                    defaultNavaid: navaidId
+                });
                 break;
             } catch (error) {
                 if (!(error instanceof DataIntegrityError)) {

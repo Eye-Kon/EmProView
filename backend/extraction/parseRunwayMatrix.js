@@ -144,8 +144,71 @@ function parseRunwayMatrix(rawResponse) {
     };
 }
 
+/**
+ * Fills TRACK_TO_DME legs that the LLM left with navaid: null.
+ *
+ * Group-level / header navaids (e.g. TCH on a KSLC AT column) propagate
+ * downward to later rows, and a single unique station in the matrix — or
+ * the request's default navaid — fills remaining gaps. Charted DME legs
+ * must never reach the solver without a station. Provenance on the leg
+ * is unchanged: this is station inheritance, not a new OCR claim.
+ *
+ * @param {{runways: Array<{identifier: string, legs: object[]}>}} matrix
+ * @param {{defaultNavaid?: string|null}} [options]
+ */
+function propagateMatrixNavaids(matrix, { defaultNavaid = null } = {}) {
+    if (!matrix || !Array.isArray(matrix.runways)) {
+        throw new DataIntegrityError("Navaid propagation requires a parsed runway matrix.");
+    }
+
+    const named = new Set();
+
+    for (const runway of matrix.runways) {
+        for (const leg of runway.legs) {
+            if (leg.type === "TRACK_TO_DME" && typeof leg.navaid === "string" && leg.navaid.trim() !== "") {
+                named.add(leg.navaid.trim().toUpperCase());
+            }
+        }
+    }
+
+    const fallback = typeof defaultNavaid === "string" && defaultNavaid.trim() !== ""
+        ? defaultNavaid.trim().toUpperCase()
+        : null;
+    const groupNavaid = named.size === 1 ? [...named][0] : fallback;
+
+    let lastSeen = null;
+
+    for (const runway of matrix.runways) {
+        for (const leg of runway.legs) {
+            if (leg.type !== "TRACK_TO_DME") {
+                continue;
+            }
+
+            if (typeof leg.navaid === "string" && leg.navaid.trim() !== "") {
+                lastSeen = leg.navaid.trim().toUpperCase();
+                leg.navaid = lastSeen;
+                continue;
+            }
+
+            const inherited = lastSeen || groupNavaid;
+
+            if (!inherited) {
+                throw new DataIntegrityError(
+                    `Runway ${runway.identifier}: TRACK_TO_DME is missing a navaid and no group-level ` +
+                        `or header navaid (e.g. TCH) could be inherited.`
+                );
+            }
+
+            leg.navaid = inherited;
+        }
+    }
+
+    return matrix;
+}
+
 module.exports = {
     LEG_TYPES,
     LEG_PROVENANCES,
-    parseRunwayMatrix
+    parseRunwayMatrix,
+    propagateMatrixNavaids
 };
