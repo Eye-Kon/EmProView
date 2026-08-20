@@ -75,6 +75,79 @@ function runwayFixIdent(transition) {
     return `RW${ident}`.slice(0, 5);
 }
 
+function navaidIdentOf(value) {
+    if (typeof value === "string" && value.trim() !== "") {
+        return value.trim().toUpperCase();
+    }
+
+    return null;
+}
+
+/**
+ * Charted station ident for ICAO-region lookup. Prefers TRACK_TO_DME
+ * (`leg.navaid` or `leg.dme.navaid`), then any other canonical navaid,
+ * then spatialTrigger.referenceNavaid on the verified tree.
+ */
+function collectNavaidIdent(legs, procedure) {
+    const list = Array.isArray(legs) ? legs : [];
+
+    for (const leg of list) {
+        if (leg?.type !== "TRACK_TO_DME") {
+            continue;
+        }
+
+        const ident = navaidIdentOf(leg.navaid) || navaidIdentOf(leg.dme?.navaid);
+        if (ident) {
+            return ident;
+        }
+    }
+
+    for (const leg of list) {
+        const ident = navaidIdentOf(leg?.navaid) || navaidIdentOf(leg?.dme?.navaid);
+        if (ident) {
+            return ident;
+        }
+    }
+
+    const rows = Array.isArray(procedure?.procedureRows) ? procedure.procedureRows : [];
+
+    for (const row of rows) {
+        const segments = Array.isArray(row?.geometry?.segments) ? row.geometry.segments : [];
+
+        for (const segment of segments) {
+            const ident = navaidIdentOf(segment?.spatialTrigger?.referenceNavaid);
+            if (ident) {
+                return ident;
+            }
+        }
+    }
+
+    return null;
+}
+
+async function resolveIcaoCode(nav, { legs, procedure, runway, flightDate }) {
+    const ident = collectNavaidIdent(legs, procedure);
+    const origin = { latitude: runway.latitude, longitude: runway.longitude };
+
+    if (ident) {
+        const station = await nav.getNavaid(ident, origin, flightDate);
+        return icaoRegionFromState(station.state, station.identifier);
+    }
+
+    if (typeof nav.getNearestNavaid === "function") {
+        const nearest = await nav.getNearestNavaid(origin, flightDate);
+        return icaoRegionFromState(nearest.state, nearest.identifier);
+    }
+
+    if (runway.state) {
+        return icaoRegionFromState(runway.state, runway.airportCode);
+    }
+
+    throw new DataIntegrityError(
+        "ARINC 424 export failed: ICAO region could not be resolved from ground-truth navaid state."
+    );
+}
+
 /**
  * Serializes one locked procedure to 132-character PD records.
  *
@@ -115,23 +188,7 @@ async function generateArinc424Records(procedure, {
         );
     }
 
-    const dmeIdent = legs.find((leg) => leg.type === "TRACK_TO_DME")?.navaid;
-    let icaoCode = null;
-
-    if (dmeIdent) {
-        const station = await nav.getNavaid(
-            dmeIdent,
-            { latitude: runway.latitude, longitude: runway.longitude },
-            flightDate
-        );
-        icaoCode = icaoRegionFromState(station.state, station.identifier);
-    }
-
-    if (!icaoCode) {
-        throw new DataIntegrityError(
-            `ARINC 424 export failed: ICAO region could not be resolved from ground-truth navaid state.`
-        );
-    }
+    const icaoCode = await resolveIcaoCode(nav, { legs, procedure, runway, flightDate });
 
     const recordType = identity.operator_id === "FAA" ? "S" : "T";
     const customerAreaCode = identity.operator_id === "FAA" ? "USA" : identity.operator_id;

@@ -456,7 +456,80 @@ async function getRunway(airportCode, runwayIdentifier, flightDate = new Date())
         // is a DataIntegrityError — never guessed, never defaulted to 0.
         elevation_ft: requireFiniteNumber(runway.elevation_ft, `${fieldPath}.elevation_ft`),
         magneticVariation: requireFiniteNumber(runway.magneticVariation, `${fieldPath}.magneticVariation`),
+        state: typeof runway.state === "string" && runway.state.trim() !== ""
+            ? runway.state.trim().toUpperCase()
+            : null,
         airacCycle: activeCycle.ident
+    };
+}
+
+/**
+ * Nearest public navaid to a WGS-84 origin, used when a PD record needs an
+ * ICAO region but the procedure has no TRACK_TO_DME ident (heading-only VM).
+ * Stations beyond ENROUTE_FALLBACK_RADIUS_NM are the wrong facility.
+ *
+ * @param {{latitude:number,longitude:number}} referencePoint
+ * @param {Date|string|number} [flightDate]
+ */
+async function getNearestNavaid(referencePoint, flightDate = new Date()) {
+    const activeCycle = await determineActiveCycle(flightDate);
+
+    if (!Number.isFinite(referencePoint?.latitude) || !Number.isFinite(referencePoint?.longitude)) {
+        throw new DataIntegrityError(
+            "Nearest navaid lookup requires finite WGS-84 reference coordinates."
+        );
+    }
+
+    const documents = await getCollection().find({
+        docType: "navaid",
+        airacCycle: activeCycle.ident
+    }).project({ identifier: 1, candidates: 1 }).toArray();
+
+    let best = null;
+
+    for (const document of documents) {
+        const candidates = Array.isArray(document.candidates) ? document.candidates : [];
+
+        for (const candidate of candidates) {
+            if (!Number.isFinite(candidate.latitude) || !Number.isFinite(candidate.longitude)) {
+                continue;
+            }
+
+            if (typeof candidate.state !== "string" || candidate.state.trim() === "") {
+                continue;
+            }
+
+            const distanceNM = greatCircleDistanceNM(referencePoint, candidate);
+
+            if (!best || distanceNM < best.distanceNM) {
+                best = {
+                    identifier: document.identifier,
+                    candidate,
+                    distanceNM
+                };
+            }
+        }
+    }
+
+    if (!best || best.distanceNM > ENROUTE_FALLBACK_RADIUS_NM) {
+        throw new DataIntegrityError(
+            `ICAO region could not be resolved: no ground-truth navaid within ` +
+                `${ENROUTE_FALLBACK_RADIUS_NM} NM of the procedure origin in AIRAC cycle ${activeCycle.ident}.`
+        );
+    }
+
+    return {
+        identifier: best.identifier,
+        name: best.candidate.name,
+        type: best.candidate.type,
+        state: best.candidate.state.trim().toUpperCase(),
+        latitude: best.candidate.latitude,
+        longitude: best.candidate.longitude,
+        airacCycle: activeCycle.ident,
+        selection: {
+            tier: "nearest",
+            distanceNM: Number(best.distanceNM.toFixed(2))
+        }
     };
 }
 
@@ -464,6 +537,7 @@ module.exports = {
     initNavDb,
     ensureNavDataIndexes,
     getNavaid,
+    getNearestNavaid,
     getRunway,
     resolveTriggerNavaid,
     determineActiveCycle,

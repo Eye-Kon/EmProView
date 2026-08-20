@@ -164,6 +164,65 @@ async function main() {
     assert.strictEqual(decodePdRecord(records[1]).magneticCourse, "3200");
     console.log("  ok — exporter emits two 132-char PD lines; VD course from NASR trueToMagnetic");
 
+    let nearestCalls = 0;
+    const headingOnly = {
+        operator_id: "AAL",
+        airport_icao: "KSLC",
+        procedure_ident: "EF35A",
+        route_type: "0",
+        transition: "35",
+        procedureRows: [
+            {
+                runways: ["35"],
+                assignedHeadingDegrees: 330,
+                turnDirection: "left",
+                integrity: { status: "enriched", errors: [] },
+                legs: [
+                    {
+                        type: "TURN_TO_HEADING",
+                        value: 330,
+                        direction: "LEFT",
+                        navaid: null
+                    }
+                ]
+            }
+        ]
+    };
+
+    const headingNav = {
+        async getRunway() {
+            return {
+                airportCode: "KSLC",
+                runwayIdentifier: "35",
+                latitude: 40.7726,
+                longitude: -111.9621,
+                trueHeading: 360,
+                magneticVariation: 11.0,
+                elevation_ft: 4227
+            };
+        },
+        async getNavaid() {
+            throw new Error("getNavaid must not run when no DME ident is present");
+        },
+        async getNearestNavaid() {
+            nearestCalls += 1;
+            return { identifier: "TCH", state: "UT", latitude: 40.85, longitude: -111.98 };
+        }
+    };
+
+    const headingRecords = await generateArinc424Records(headingOnly, {
+        airacCycle: { ident: "2608" },
+        flightDate: new Date("2026-08-17T12:00:00Z"),
+        navDb: headingNav
+    });
+
+    assert.strictEqual(nearestCalls, 1);
+    assert.strictEqual(headingRecords.length, 1);
+    assert.strictEqual(headingRecords[0].length, RECORD_LENGTH);
+    assert.strictEqual(decodePdRecord(headingRecords[0]).pathTerminator, "VM");
+    assert.strictEqual(decodePdRecord(headingRecords[0]).icaoCode, "K2");
+    console.log("  ok — heading-only VM resolves ICAO region K2 from nearest ground-truth navaid (TCH/UT)");
+
     await assert.rejects(
         () => generateArinc424Records(
             { ...verifiedProcedure(), procedureRows: [{ ...verifiedProcedure().procedureRows[0], integrity: { status: "failed" } }] },
