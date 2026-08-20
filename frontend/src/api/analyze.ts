@@ -1,24 +1,10 @@
+import { API_BASE_URL, getApiKey } from './client'
 import {
   AnalyzeApiError,
   type AnalyzeRequest,
   type AnalyzeResponse,
   type ApiErrorBody,
 } from '../types/analyze'
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
-
-function getApiKey(): string {
-  const apiKey = import.meta.env.VITE_API_KEY
-
-  if (!apiKey) {
-    throw new AnalyzeApiError(
-      0,
-      'VITE_API_KEY is not configured. Add it to frontend/.env before submitting.',
-    )
-  }
-
-  return apiKey
-}
 
 async function parseErrorBody(
   response: Response,

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { analyzeProcedure } from './api/analyze'
 import { ControlPanel } from './components/ControlPanel'
+import { CycleExportPanel } from './components/CycleExportPanel'
 import { DataReadout } from './components/DataReadout'
 import { MapCanvas } from './components/MapCanvas'
 import { DEFAULT_ANALYZE_REQUEST } from './constants/defaults'
@@ -93,6 +94,8 @@ function App() {
             <span>Solving geodetic path…</span>
           </div>
         ) : null}
+
+        <CycleExportPanel />
 
         {/* Phase 4.3: the unified FeatureCollection carries every runway's
             solved escape path — the map renders the full spiderweb at once. */}
